@@ -1,0 +1,27 @@
+# Netlify deployment.
+#
+# The frontend is plain static files; the API, the Telegram webhook and the two
+# cron jobs are Functions. Route paths are declared inside each function
+# (Functions v2 `config.path` / `config.schedule`), so there are no redirects
+# to keep in sync here.
+
+[build]
+  publish = "web"
+  command = "npm ci --omit=dev"
+
+[build.environment]
+  NODE_VERSION = "22"
+
+[functions]
+  directory = "netlify/functions"
+  node_bundler = "esbuild"
+  # src/ is outside the functions directory, so it has to be bundled in.
+  included_files = ["src/**"]
+  # pg does a conditional require of the optional pg-native binding, which
+  # esbuild cannot statically resolve. Shipping it unbundled avoids that.
+  external_node_modules = ["pg"]
+
+[dev]
+  command = "npm start"
+  targetPort = 8787
+  publish = "web"

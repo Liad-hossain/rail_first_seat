@@ -387,6 +387,73 @@ fails.
 
 ---
 
+## Deploying to Netlify
+
+Netlify has no always-on process, so the three background workers cannot run as
+they do locally. The port swaps each for something serverless-shaped, and the
+routes themselves are shared verbatim — `src/server.js` exposes a transport-
+agnostic `dispatch()` that both `src/serve.js` (Node) and
+`netlify/functions/api.mjs` (Fetch) call.
+
+| Local (persistent) | Netlify |
+| --- | --- |
+| HTTP listener in `src/serve.js` | `netlify/functions/api.mjs`, path `/api/*` |
+| Telegram long-poll loop | `netlify/functions/telegram-webhook.mjs` — Telegram pushes updates |
+| In-process alarm scheduler | `netlify/functions/alarm-tick.mjs`, cron `* * * * *` |
+| Hourly collector | `netlify/functions/collect.mjs`, cron `7 * * * *` |
+
+**The one real cost is precision.** Locally an alarm fires within ~750 ms of the
+sale instant. Cron granularity is one minute, so the tick runs every minute and
+waits out the last few seconds inside the invocation — expect a few seconds of
+lag instead. For a sale that drains over minutes that is usually fine, but it is
+strictly worse than running a persistent process.
+
+### Steps
+
+1. **A cloud database.** Create a Supabase project and take
+   *Settings → Database → Connection string → URI*. Use the **transaction
+   pooler** (port 6543): every function container opens its own connection.
+2. **Seed the catalog once**, from your machine — the ~1 minute crawl is longer
+   than a function may run, and `POST /api/sync` deliberately refuses on
+   Netlify rather than appearing to start:
+   ```bash
+   SUPABASE_DB_URL='<cloud url>' npm run db:setup
+   SUPABASE_DB_URL='<cloud url>' npm run sync
+   ```
+3. **Connect the repo** in Netlify. `netlify.toml` already sets publish dir,
+   build command, functions dir and Node 22 — leave the UI fields empty.
+4. **Environment variables** (Site configuration → Environment variables):
+
+   | Variable | Value |
+   | --- | --- |
+   | `SUPABASE_DB_URL` | the pooler URI from step 1 |
+   | `TELEGRAM_WEBHOOK_SECRET` | any random string — `node -e "console.log(require('crypto').randomBytes(24).toString('base64url'))"` |
+   | `NODE_ENV` | `production` |
+   | `PG_SSL_MODE` | `require` |
+
+   `PUBLIC_BASE_URL` is optional: Netlify injects `URL` and the code falls back
+   to it. Set it explicitly if you use a custom domain.
+5. **Deploy**, then open the site, paste the bot token in **Alarms** and the
+   session token in **Settings**. Saving the bot token registers the webhook at
+   `https://<your-site>/api/telegram/webhook` automatically — the panel confirms
+   with *webhook registered*.
+6. **Check the crons** under *Site configuration → Functions → Scheduled
+   functions*. `alarm-tick` should be listed as running every minute.
+
+### Gotchas
+
+- **Scheduled functions do not run on deploy previews**, only on the production
+  deploy. Alarms set against a preview URL will never fire.
+- A **paused or unpublished** site stops the crons — same silent failure as a
+  sleeping free tier.
+- Netlify's free tier includes a monthly function-invocation allowance. A
+  once-a-minute cron is ~43,200 invocations/month before any traffic; check the
+  current limit before relying on it.
+- If you later move back to a persistent host, set `TELEGRAM_POLLING=1` and
+  re-save the bot token — it clears the webhook and returns to long-polling.
+
+---
+
 ## Project layout
 
 ```
@@ -400,11 +467,14 @@ src/
   history.js      snapshot recording, history digests, hourly collector
   telegram.js     Bot API transport and the long-poll update loop (no deps)
   notify.js       alarm rules, the 3-per-person cap, pairing, the scheduler
-  server.js       HTTP server, JSON API, security headers, static hosting
+  server.js       routes, validation, security headers, transport-agnostic dispatch()
+  serve.js        Node entry point: HTTP listener + background workers
 web/
   index.html styles.css app.js       no framework, no build step
 scripts/
   db-setup.js  sync-catalog.js  run-snapshot.js
+netlify/functions/
+  api.mjs  telegram-webhook.mjs  alarm-tick.mjs  collect.mjs
 supabase/
   schema.sql      the same DDL the server applies, for the Supabase SQL editor
 test/

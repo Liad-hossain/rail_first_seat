@@ -1,5 +1,9 @@
 /**
- * HTTP server: JSON API + static frontend.
+ * The API: routes, helpers and a transport-agnostic dispatch().
+ *
+ * Deliberately free of any listening side effect, so it can be driven by the
+ * Node HTTP server (src/serve.js) or by a serverless function
+ * (netlify/functions/api.mjs) without change.
  *
  * Security note on credentials: the Supabase connection string is read from the
  * environment inside this process and used only to talk to Postgres. It is
@@ -14,7 +18,7 @@ import fsp from 'node:fs/promises';
 import path from 'node:path';
 import {
   PORT, WEB_DIR, SEAT_CLASSES, SEAT_CLASS_LABELS, ADVANCE_DAYS, SITE_BASE,
-  NODE_ENV, MAX_ALERTS_PER_SUBSCRIBER,
+  NODE_ENV, MAX_ALERTS_PER_SUBSCRIBER, SERVERLESS,
 } from './config.js';
 import { migrate, verifyConnection, getMeta, setMeta, catalogIsEmpty, closePool } from './db.js';
 import {
@@ -469,6 +473,15 @@ const handlers = {
   },
 
   'POST /api/sync': async () => {
+    // ~134 upstream requests at 350ms apart. A function invocation is killed
+    // long before that, and a half-finished crawl inside a transaction would
+    // just roll back — so say why instead of appearing to start.
+    if (SERVERLESS) {
+      throw new HttpError(501,
+        'The catalog crawl takes about a minute — longer than a serverless function may run. '
+        + 'Run it once from your machine against this database: '
+        + "SUPABASE_DB_URL='<your url>' npm run sync");
+    }
     if (syncState.running) return { started: false, running: true, ...syncState };
     runSync().catch((err) => { syncState.lastResult = { error: err.message }; });
     return { started: true };
@@ -568,142 +581,43 @@ const handlers = {
   },
 };
 
-/* -------------------------------- wiring -------------------------------- */
-
-const server = http.createServer(async (req, res) => {
-  const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
-  const key = `${req.method} ${url.pathname}`;
-
-  try {
-    const handler = handlers[key];
-    if (handler) {
-      const body = req.method === 'POST' || req.method === 'PUT' ? await readBody(req) : {};
-      return sendJson(res, 200, await handler({ query: url.searchParams, body, req }));
-    }
-    if (url.pathname.startsWith('/api/')) {
-      throw new HttpError(404, `No such endpoint: ${req.method} ${url.pathname}`);
-    }
-    if (req.method !== 'GET' && req.method !== 'HEAD') throw new HttpError(405, 'Method not allowed');
-    return await serveStatic(req, res, url.pathname);
-  } catch (err) {
-    if (err instanceof HttpError) {
-      return sendJson(res, err.status, { error: err.message, ...err.extra });
-    }
-    if (err instanceof UpstreamError) {
-      return sendJson(res, err.needsAuth ? 401 : 502, {
-        error: err.message, code: err.code, needsAuth: err.needsAuth,
-      });
-    }
-    // Every NotifyError is something the user can act on — say exactly what.
-    if (err instanceof NotifyError) {
-      return sendJson(res, 400, { error: err.message, code: err.code });
-    }
-    console.error('unhandled error', err);
-    // Generic message in production: internal errors can carry connection detail.
-    return sendJson(res, 500, {
-      error: NODE_ENV === 'production' ? 'Internal server error' : (err.message || 'Internal error'),
-    });
-  }
-});
-
-/* --------------------------------- boot --------------------------------- */
+/* -------------------------------- dispatch -------------------------------- */
 
 /**
- * Turn listen failures into an explanation instead of an unhandled 'error'
- * event and a stack trace. EADDRINUSE in particular is routine — usually an
- * earlier instance of this very server still running.
+ * Run one request against the route table.
+ *
+ * Takes a plain description of a request rather than a Node req/res, so the
+ * same routes serve both the long-running server and a serverless function.
+ * Returns a status and a JSON-serialisable body; it never throws.
  */
-server.on('error', (err) => {
-  if (err.code === 'EADDRINUSE') {
-    console.error(
-      `\n  Port ${PORT} is already in use — most likely another copy of this ` +
-      'server is still running.\n\n' +
-      '  See what is holding it:\n' +
-      `    lsof -nP -iTCP:${PORT} -sTCP:LISTEN\n\n` +
-      '  Stop it:\n' +
-      '    pkill -f "node src/server.js"\n\n' +
-      '  Or start on a different port:\n' +
-      `    PORT=${PORT + 1} npm start\n`,
-    );
-  } else if (err.code === 'EACCES') {
-    console.error(
-      `\n  Not allowed to bind port ${PORT}. Ports below 1024 need elevated ` +
-      'privileges — use a higher port, e.g. PORT=8787 npm start\n',
-    );
-  } else {
-    console.error(`\n  Server failed to start: ${err.message}\n`);
-  }
-  closePool().catch(() => {}).finally(() => process.exit(1));
-});
+export async function dispatch({ method, pathname, searchParams, body = {}, headers = {} }) {
+  const key = `${method} ${pathname}`;
+  const handler = handlers[key];
 
-async function start() {
-  let conn;
   try {
-    conn = await verifyConnection();
-    await migrate();
+    if (!handler) throw new HttpError(404, `No such endpoint: ${method} ${pathname}`);
+    // Handlers reach for req.headers; give them just that.
+    const req = { headers };
+    return { status: 200, body: await handler({ query: searchParams, body, req }) };
   } catch (err) {
-    console.error(`\n  Cannot start: ${err.message}\n`);
-    process.exit(1);
-  }
-
-  // Must happen before the collector or any search runs: the session token is
-  // only accepted alongside the device it was issued to.
-  setDeviceIdentity(await getDeviceIdentity());
-
-  const [catalog, token, overview, notify] = await Promise.all([
-    catalogStatus(), getToken(), historyOverview(), notifyStatus(),
-  ]);
-
-  server.listen(PORT, () => {
-    console.log(`\n  rail_first_seat  →  http://localhost:${PORT}\n`);
-    console.log(`  database: ${conn.version} at ${conn.label}`);
-    console.log(`  catalog : ${catalog.trains} trains, ${catalog.stations} stations, ${catalog.stops} stops` +
-      (catalog.syncedAt ? ` (synced ${catalog.syncedAt})` : ''));
-    console.log(`  session : ${token ? 'token present — live seat counts enabled' : 'no token — schedules and sale times only'}`);
-    console.log(`  history : ${overview.snapshots} snapshot(s) recorded`);
-    console.log(`  alarms  : ${notify.configured
-      ? `Telegram @${notify.botUsername} — sale-open alarms enabled`
-      : 'no bot connected yet — add one in Settings to enable alarms'}\n`);
-  });
-
-  // Seeding needs the catalog, so it waits for a first-run sync to finish.
-  const seedWatchlist = async () => {
-    if (!process.env.BR_WATCH || (await listWatches()).length > 0) return;
-    for (const pair of process.env.BR_WATCH.split(',')) {
-      const [f, t] = pair.split('>').map((s) => s?.trim());
-      if (!f || !t) continue;
-      try {
-        await addWatch(await resolveStation(f, 'from'), await resolveStation(t, 'to'));
-        console.log(`  watchlist: tracking ${f} → ${t}`);
-      } catch (e) {
-        console.warn(`  watchlist: skipped "${pair}" — ${e.message}`);
-      }
+    if (err instanceof HttpError) return { status: err.status, body: { error: err.message, ...err.extra } };
+    if (err instanceof UpstreamError) {
+      return {
+        status: err.needsAuth ? 401 : 502,
+        body: { error: err.message, code: err.code, needsAuth: err.needsAuth },
+      };
     }
-  };
+    if (err instanceof NotifyError) return { status: 400, body: { error: err.message, code: err.code } };
 
-  if (await catalogIsEmpty()) {
-    console.log('  Catalog is empty — fetching it now from Bangladesh Railway (~1 min)…');
-    runSync()
-      .then(async (r) => {
-        console.log(`  Catalog ready: ${r.trains} trains, ${r.stations} stations.\n`);
-        await seedWatchlist();
-      })
-      .catch((e) => console.error(`  Catalog sync failed: ${e.message}\n`));
-  } else {
-    await seedWatchlist();
+    console.error('unhandled error', err);
+    return {
+      status: 500,
+      body: { error: NODE_ENV === 'production' ? 'Internal server error' : (err.message || 'Internal error') },
+    };
   }
-
-  startCollector({ getToken, log: (m) => console.log(`  ${m}`) });
-  startNotifications({ log: (m) => console.log(`  ${m}`) });
 }
 
-for (const signal of ['SIGINT', 'SIGTERM']) {
-  process.on(signal, async () => {
-    console.log('\n  shutting down…');
-    server.close();
-    await closePool().catch(() => {});
-    process.exit(0);
-  });
-}
-
-start();
+export {
+  handlers, HttpError, SECURITY_HEADERS, sendJson, serveStatic, readBody,
+  resolveStation, runSync, getToken, getDeviceIdentity, syncState,
+};

@@ -129,6 +129,27 @@ export async function clearWebhookIfSet({ token = null, log = () => {} } = {}) {
   }
 }
 
+/**
+ * Point the bot at a webhook instead of polling.
+ *
+ * Serverless has nowhere to run a long poll, so updates have to be pushed. The
+ * secret token is echoed back by Telegram in the
+ * X-Telegram-Bot-Api-Secret-Token header, which is what stops anyone who
+ * guesses the URL from injecting fake updates.
+ */
+export async function setWebhook(url, { secret = null, token = null } = {}) {
+  return callApi('setWebhook', {
+    url,
+    allowed_updates: ['message', 'callback_query'],
+    drop_pending_updates: false,
+    ...(secret ? { secret_token: secret } : {}),
+  }, { token });
+}
+
+export async function getWebhookInfo({ token = null } = {}) {
+  return callApi('getWebhookInfo', {}, { token });
+}
+
 export async function sendMessage(chatId, text, { buttons = null, silent = false } = {}) {
   return callApi('sendMessage', {
     chat_id: chatId,

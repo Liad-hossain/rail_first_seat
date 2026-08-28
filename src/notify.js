@@ -18,7 +18,7 @@ import {
   MAX_ALERTS_PER_SUBSCRIBER, ALARM_RING_INTERVAL_MS,
   SCHEDULER_SCAN_MS, SCHEDULER_LOOKAHEAD_MS, PAIR_CODE_TTL_MS, ADVANCE_DAYS,
   TELEGRAM_BOT_TOKEN, ALARM_REPEAT, ALARM_MAX_DURATION_MS, ALARM_MAX_RINGS,
-  ALARM_TRIGGER_TAG,
+  ALARM_TRIGGER_TAG, WEBHOOK_MODE, PUBLIC_BASE_URL, TELEGRAM_WEBHOOK_SECRET,
   ALARM_TEST_DURATION_MS, TEST_ALARM_DELAY_SECONDS, TEST_ALARM_MAX_DELAY_SECONDS,
 } from './config.js';
 import { query, one, transact, isoTimestamp, getMeta, setMeta } from './db.js';
@@ -28,7 +28,8 @@ import { bookingUrl } from './shohoz.js';
 import { addDays, prettyDate, todayISO, daysBetween } from './time.js';
 import {
   botConfigured, getBot, sendMessage, answerCallback, startTelegramListener,
-  setBotTokenProvider, clearWebhookIfSet, deleteMessage, editMessageText, esc,
+  setBotTokenProvider, clearWebhookIfSet, setWebhook, deleteMessage,
+  editMessageText, esc,
 } from './telegram.js';
 
 /** Thrown for user-fixable problems; the server maps it to a 400. */
@@ -55,6 +56,15 @@ const newToken = () => crypto.randomBytes(24).toString('base64url');
 export async function getBotToken() {
   return (await getMeta('telegram_bot_token')) || TELEGRAM_BOT_TOKEN || null;
 }
+
+/**
+ * Installed at module load, not in startNotifications(): a serverless function
+ * imports this module and calls into it directly without ever starting the
+ * background workers, and it still needs the token to come from the database.
+ * Reading through a provider (rather than caching) also means a token saved in
+ * the UI takes effect immediately.
+ */
+setBotTokenProvider(getBotToken);
 
 /** Never returns the token — only a masked preview and where it came from. */
 export async function botTokenInfo() {
@@ -104,9 +114,18 @@ export async function setBotToken(token) {
     );
   }
 
-  // A registered webhook makes getUpdates 409 forever, so pairing would never
-  // happen and the only symptom would be "pressing Start does nothing".
-  const webhook = await clearWebhookIfSet({ token: trimmed });
+  // Two mutually exclusive delivery modes. On a serverless host there is no
+  // process to hold a long poll, so updates must be pushed to a function;
+  // everywhere else a stale webhook would make getUpdates 409 forever and the
+  // only symptom would be "pressing Start does nothing".
+  let webhook = { had: false };
+  if (WEBHOOK_MODE) {
+    const url = `${PUBLIC_BASE_URL.replace(/\/+$/, '')}/api/telegram/webhook`;
+    await setWebhook(url, { secret: TELEGRAM_WEBHOOK_SECRET || null, token: trimmed });
+    webhook = { registered: url };
+  } else {
+    webhook = await clearWebhookIfSet({ token: trimmed });
+  }
 
   const previous = await getMeta('telegram_bot_token');
   await setMeta('telegram_bot_token', trimmed);
@@ -124,6 +143,7 @@ export async function setBotToken(token) {
   return {
     botUsername: me.username, botName: me.name, swapped, strandedChats,
     webhookRemoved: webhook.had === true,
+    webhookRegistered: webhook.registered || null,
   };
 }
 
@@ -137,6 +157,7 @@ export async function notifyStatus() {
     ringIntervalSeconds: ALARM_RING_INTERVAL_MS / 1000,
     ringMinutes: Math.round(ALARM_MAX_DURATION_MS / 60_000),
     triggerTag: ALARM_TRIGGER_TAG,
+    delivery: WEBHOOK_MODE ? 'webhook' : 'polling',
     token: await botTokenInfo(),
   };
   if (!(await botConfigured())) return { ...base, configured: false, botUsername: null };
@@ -840,11 +861,80 @@ export function startAlertScheduler({ log = console.log } = {}) {
 }
 
 /** Boot both halves: the update listener and the scheduler. */
-export function startNotifications({ log = console.log } = {}) {
-  // Read fresh every time: the token can be saved or replaced from the UI
-  // while the server runs, and both loops below must see the change at once.
-  setBotTokenProvider(getBotToken);
+/**
+ * One pass of the alarm work, with no timers left behind.
+ *
+ * The long-running scheduler arms a precise setTimeout and is accurate to the
+ * millisecond; a serverless platform has no such luxury, so this is the shape
+ * a cron invocation needs: do everything that is due, optionally wait out the
+ * last few seconds for something about to become due, and return.
+ *
+ * `waitWindowMs` is how long it may sleep in-invocation to land on an opening
+ * instant precisely. Keep it comfortably under the platform's timeout.
+ */
+export async function runAlarmTick({ log = console.log, waitWindowMs = 5_000 } = {}) {
+  const out = { expired: 0, fired: 0, retried: 0, waitedMs: 0 };
 
+  const expired = await query(
+    "UPDATE alerts SET status = 'expired' WHERE status = 'active' AND journey_date < $1 RETURNING id",
+    [todayISO()],
+  );
+  out.expired = expired.length;
+  await query("DELETE FROM alerts WHERE is_test = TRUE AND created_at < now() - INTERVAL '1 day'");
+
+  if (!(await botConfigured())) return out;
+
+  // Anything already due, plus anything due inside the window we can wait for.
+  const cutoff = new Date(Date.now() + waitWindowMs).toISOString();
+  const due = await query(
+    "SELECT id, opens_at FROM alerts WHERE status = 'active' AND opens_at <= $1 ORDER BY opens_at LIMIT 50",
+    [cutoff],
+  );
+
+  for (const row of due) {
+    const waitMs = new Date(row.opens_at).getTime() - Date.now();
+    if (waitMs > 0) {
+      // Land on the instant rather than up to a minute after it.
+      await new Promise((r) => setTimeout(r, Math.min(waitMs, waitWindowMs)));
+      out.waitedMs += Math.min(waitMs, waitWindowMs);
+    }
+    await fire(row.id, log);
+    out.fired += 1;
+  }
+
+  // A previous invocation may have claimed an alarm and then failed to send —
+  // Telegram times out often enough that this is worth retrying explicitly.
+  const undelivered = await query(
+    `SELECT * FROM alerts
+      WHERE status = 'fired' AND rings_sent = 0 AND acknowledged_at IS NULL
+        AND fired_at > now() - INTERVAL '15 minutes'
+      LIMIT 20`,
+  );
+  for (const row of undelivered) {
+    try {
+      await ring(row, { ring: 1, late: true }, log);
+      out.retried += 1;
+    } catch (err) {
+      log(`alarm: retry failed for ${row.id} — ${err.message}`);
+    }
+  }
+
+  return out;
+}
+
+/**
+ * Handle a single Telegram update.
+ *
+ * Long-polling and webhooks deliver the identical payload, so both paths land
+ * here and no behaviour can drift between deployment styles.
+ */
+export async function handleTelegramUpdate(update, { log = console.log } = {}) {
+  if (update?.message) return makeMessageHandler(log)(update.message);
+  if (update?.callback_query) return makeCallbackHandler(log)(update.callback_query);
+  return null;
+}
+
+export function startNotifications({ log = console.log } = {}) {
   const listener = startTelegramListener({
     getOffset: () => getMeta('telegram_update_offset', '0'),
     setOffset: (v) => setMeta('telegram_update_offset', v),

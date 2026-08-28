@@ -20,6 +20,16 @@ if (fs.existsSync(path.join(ROOT, '.env'))) {
 export const PORT = Number(process.env.PORT || 8787);
 export const NODE_ENV = process.env.NODE_ENV || 'development';
 
+/**
+ * True inside a Netlify/Lambda function. Two things must change there: the
+ * Postgres pool shrinks to one connection (every container opens its own, and
+ * a pooler has a hard cap), and work that outlives a function invocation —
+ * the ~1 minute catalog crawl — has to be refused with an explanation rather
+ * than started and silently killed.
+ */
+export const SERVERLESS =
+  process.env.NETLIFY === 'true' || Boolean(process.env.AWS_LAMBDA_FUNCTION_NAME);
+
 /* ------------------------------------------------------------------ *
  * Database — Supabase Postgres
  *
@@ -73,7 +83,7 @@ export function safeDatabaseLabel() {
 /** TLS: required for Supabase, pointless for a local container. */
 export const PG_SSL_MODE = process.env.PG_SSL_MODE || 'auto'; // auto | require | strict | disable
 export const SUPABASE_CA_CERT = process.env.SUPABASE_CA_CERT || '';
-export const PG_POOL_MAX = Number(process.env.PG_POOL_MAX || 8);
+export const PG_POOL_MAX = Number(process.env.PG_POOL_MAX || (SERVERLESS ? 1 : 8));
 
 /* ------------------------------------------------------------------ *
  * Upstream (Shohoz-operated Bangladesh Railway e-ticketing backend)
@@ -122,6 +132,19 @@ export const ZONE_OPENING_TIME = { WEST: '08:00:00', EAST: '14:00:00' };
  * ------------------------------------------------------------------ */
 
 export const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
+
+/**
+ * Serverless deployments cannot long-poll, so they receive updates by webhook.
+ *
+ * PUBLIC_BASE_URL is the site's own https origin (Netlify injects it as URL).
+ * When it is set, saving a bot token registers a webhook instead of relying on
+ * the polling loop. TELEGRAM_WEBHOOK_SECRET is echoed back by Telegram and
+ * verified on every request.
+ */
+export const PUBLIC_BASE_URL =
+  process.env.PUBLIC_BASE_URL || process.env.URL || '';
+export const TELEGRAM_WEBHOOK_SECRET = process.env.TELEGRAM_WEBHOOK_SECRET || '';
+export const WEBHOOK_MODE = Boolean(PUBLIC_BASE_URL) && process.env.TELEGRAM_POLLING !== '1';
 // Overridable so the flow can be exercised end to end against a local stub.
 export const TELEGRAM_API = process.env.TELEGRAM_API || 'https://api.telegram.org';
 

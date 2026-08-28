@@ -6,8 +6,8 @@
   "type": "module",
   "engines": { "node": ">=20.12.0" },
   "scripts": {
-    "start": "node src/server.js",
-    "dev": "node --watch src/server.js",
+    "start": "node src/serve.js",
+    "dev": "node --watch src/serve.js",
     "db:setup": "node scripts/db-setup.js",
     "sync": "node scripts/sync-catalog.js",
     "snapshot": "node scripts/run-snapshot.js",

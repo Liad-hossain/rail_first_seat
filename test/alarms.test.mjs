@@ -40,6 +40,8 @@ mock.module(path.join(SRC, 'telegram.js'), {
     startTelegramListener: () => ({ stop() {} }),
     setBotTokenProvider: () => {},
     clearWebhookIfSet: async () => ({ had: false }),
+    setWebhook: async () => true,
+    getWebhookInfo: async () => ({ url: '' }),
     deleteMessage: async (chatId, messageId) => { deleted.push(messageId); return true; },
     editMessageText: async () => true,
     esc: (s) => String(s ?? ''),
