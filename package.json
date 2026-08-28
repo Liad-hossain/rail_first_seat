@@ -1,0 +1,19 @@
+{
+  "name": "rail_first_seat",
+  "version": "1.1.0",
+  "private": true,
+  "description": "Bangladesh Railway first-availability finder: when tickets for a route and date go on sale, which trains run it, and live seat counts plus accumulated availability history. Backed by Supabase Postgres.",
+  "type": "module",
+  "engines": { "node": ">=20.12.0" },
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js",
+    "db:setup": "node scripts/db-setup.js",
+    "sync": "node scripts/sync-catalog.js",
+    "snapshot": "node scripts/run-snapshot.js",
+    "test": "node --experimental-test-module-mocks --test test/live-merge.test.mjs test/alarms.test.mjs test/credentials.test.mjs"
+  },
+  "dependencies": {
+    "pg": "^8.13.1"
+  }
+}

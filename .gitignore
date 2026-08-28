@@ -1,0 +1,11 @@
+# Secrets — never commit. The Supabase connection string lives here locally
+# and in the hosting platform's environment settings in production.
+.env
+.env.*
+!.env.example
+*.pem
+*.crt
+
+node_modules/
+npm-debug.log*
+.DS_Store

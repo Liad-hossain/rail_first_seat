@@ -1,0 +1,184 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Train Ticket First Availability — Bangladesh Railway</title>
+<meta name="description" content="Find when Bangladesh Railway tickets for any station pair and any date first go on sale, which trains run the route, and live seat availability.">
+<link rel="stylesheet" href="styles.css">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%23006747'/%3E%3Ctext x='16' y='23' font-size='19' text-anchor='middle' fill='white' font-family='sans-serif'%3E%F0%9F%9A%86%3C/text%3E%3C/svg%3E">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <a class="logo" href="/">
+      <span class="logo-mark" aria-hidden="true">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <rect x="4" y="3" width="16" height="14" rx="3"/><path d="M4 11h16M8 3v8M16 3v8"/>
+          <path d="M8 21l2-4M16 21l-2-4M6 21h12"/>
+        </svg>
+      </span>
+      <span class="logo-text">First Availability
+        <small>Bangladesh Railway ticket finder</small>
+      </span>
+    </a>
+
+    <span class="topbar-spacer"></span>
+
+    <button class="icon-btn" id="theme-btn" type="button" title="Toggle light / dark">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+        <circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M2 12h2M20 12h2M5 5l1.5 1.5M17.5 17.5L19 19M19 5l-1.5 1.5M6.5 17.5L5 19"/>
+      </svg>
+      <span id="theme-label">Theme</span>
+    </button>
+
+    <button class="icon-btn" id="alarms-btn" type="button" title="Sale-open alarms">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+        <path d="M18 8a6 6 0 1 0-12 0c0 7-3 9-3 9h18s-3-2-3-9M13.7 21a2 2 0 0 1-3.4 0"/>
+      </svg>
+      <span id="alarms-badge">Alarms</span>
+    </button>
+
+    <button class="icon-btn" id="history-btn" type="button" title="Availability history">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+        <path d="M3 12a9 9 0 1 0 9-9 9 9 0 0 0-6.36 2.64L3 8"/><path d="M3 3v5h5M12 8v4l3 2"/>
+      </svg>
+      <span>History</span>
+    </button>
+
+    <button class="icon-btn" id="settings-btn" type="button" title="Settings">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+        <circle cx="12" cy="12" r="3"/>
+        <path d="M19.4 15a1.7 1.7 0 0 0 .34 1.87l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06A1.7 1.7 0 0 0 15 19.4a1.7 1.7 0 0 0-1 1.56V21a2 2 0 1 1-4 0v-.07A1.7 1.7 0 0 0 9 19.4a1.7 1.7 0 0 0-1.87.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.7 1.7 0 0 0 4.6 15a1.7 1.7 0 0 0-1.56-1H3a2 2 0 1 1 0-4h.07A1.7 1.7 0 0 0 4.6 9a1.7 1.7 0 0 0-.33-1.87l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.7 1.7 0 0 0 9 4.6a1.7 1.7 0 0 0 1-1.56V3a2 2 0 1 1 4 0v.07a1.7 1.7 0 0 0 1 1.56 1.7 1.7 0 0 0 1.87-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.7 1.7 0 0 0 19.4 9v.07a1.7 1.7 0 0 0 1.56 1H21a2 2 0 1 1 0 4h-.07a1.7 1.7 0 0 0-1.53 1z"/>
+      </svg>
+      <span id="settings-badge">Settings</span>
+    </button>
+  </div>
+</header>
+
+<main>
+  <section class="hero">
+    <span class="eyebrow">
+      <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><path d="M12 8v4l3 2"/><circle cx="12" cy="12" r="9"/></svg>
+      Sale opens 10 days before travel
+    </span>
+    <h1>When can you actually buy this ticket?</h1>
+    <p>
+      Bangladesh Railway only lets you <em>see</em> a date once it is inside the 10-day
+      selling window. Pick any date — even months out — and this tells you the exact
+      day and time its tickets go on sale, which trains run your route, and how many
+      seats are left right now.
+    </p>
+  </section>
+
+  <form class="search-card" id="search-form" autocomplete="off">
+    <div class="search-grid">
+      <div class="field combo" id="from-combo">
+        <label for="from-input">From station</label>
+        <input class="control" id="from-input" placeholder="Dhaka" role="combobox"
+               aria-expanded="false" aria-controls="from-list" aria-autocomplete="list" required>
+        <ul class="combo-list" id="from-list" role="listbox" hidden></ul>
+      </div>
+
+      <div class="swap-wrap">
+        <button class="swap" id="swap-btn" type="button" title="Swap stations" aria-label="Swap stations">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M7 4v13M7 4L4 7M7 4l3 3M17 20V7M17 20l3-3M17 20l-3-3"/>
+          </svg>
+        </button>
+      </div>
+
+      <div class="field combo" id="to-combo">
+        <label for="to-input">To station</label>
+        <input class="control" id="to-input" placeholder="Sreemangal" role="combobox"
+               aria-expanded="false" aria-controls="to-list" aria-autocomplete="list" required>
+        <ul class="combo-list" id="to-list" role="listbox" hidden></ul>
+      </div>
+
+      <div class="field">
+        <label for="date-input">Journey date</label>
+        <input class="control" id="date-input" type="date" required>
+      </div>
+
+      <div class="field field-go">
+        <label aria-hidden="true">&nbsp;</label>
+        <button class="btn" id="search-btn" type="submit">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M20 20l-4.3-4.3"/></svg>
+          Find
+        </button>
+      </div>
+    </div>
+
+    <div class="quick-row" id="quick-row">
+      <span class="quick-label">Popular</span>
+      <button class="chip" type="button" data-from="Dhaka" data-to="Sreemangal">Dhaka → Sreemangal</button>
+      <button class="chip" type="button" data-from="Dhaka" data-to="Sylhet">Dhaka → Sylhet</button>
+      <button class="chip" type="button" data-from="Dhaka" data-to="Chattogram">Dhaka → Chattogram</button>
+      <button class="chip" type="button" data-from="Dhaka" data-to="Rajshahi">Dhaka → Rajshahi</button>
+      <button class="chip" type="button" data-from="Dhaka" data-to="Khulna">Dhaka → Khulna</button>
+      <span class="topbar-spacer"></span>
+      <button class="chip" type="button" id="earliest-btn" title="Scan the whole selling window for the first date with a seat">
+        ⚡ Earliest date with a seat
+      </button>
+    </div>
+  </form>
+
+  <div id="results" aria-live="polite"></div>
+
+  <div id="calendar-slot"></div>
+  <div id="earliest-slot"></div>
+</main>
+
+<footer>
+  <p>
+    Schedules, running days, stop timings and ticket-sale opening times come from
+    Bangladesh Railway's own e-ticketing service. Seat counts and fares are read live
+    from your own signed-in session when you add one in Settings.
+  </p>
+  <p>
+    Always complete the purchase on
+    <a href="https://eticket.railway.gov.bd" target="_blank" rel="noopener">eticket.railway.gov.bd</a>
+    — this site never handles payments or personal data.
+  </p>
+</footer>
+
+<!-- ------------------------------ drawers ------------------------------- -->
+
+<div class="scrim" id="scrim" hidden></div>
+
+<aside class="drawer" id="settings-drawer" hidden aria-label="Settings">
+  <div class="drawer-head">
+    <h2>Settings</h2>
+    <button class="close-x" data-close type="button" aria-label="Close">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg>
+    </button>
+  </div>
+  <div class="drawer-body" id="settings-body"></div>
+</aside>
+
+<aside class="drawer" id="alarms-drawer" hidden aria-label="Sale-open alarms">
+  <div class="drawer-head">
+    <h2>Sale-open alarms</h2>
+    <button class="close-x" data-close type="button" aria-label="Close">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg>
+    </button>
+  </div>
+  <div class="drawer-body" id="alarms-body"></div>
+</aside>
+
+<aside class="drawer" id="history-drawer" hidden aria-label="Availability history">
+  <div class="drawer-head">
+    <h2>Availability history</h2>
+    <button class="close-x" data-close type="button" aria-label="Close">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg>
+    </button>
+  </div>
+  <div class="drawer-body" id="history-body"></div>
+</aside>
+
+<div class="toast-stack" id="toasts"></div>
+
+<script type="module" src="app.js"></script>
+</body>
+</html>
