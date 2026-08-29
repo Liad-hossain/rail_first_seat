@@ -444,11 +444,27 @@ strictly worse than running a persistent process.
    | `NODE_ENV` | `production` |
    | `PG_SSL_MODE` | `require` |
 
-   **Set `PUBLIC_BASE_URL` explicitly.** Without it the app cannot know its own
-   address, falls back to polling mode, and Telegram *inbound* silently dies —
-   alarms still arrive (outbound needs no webhook) while every button press and
-   `/start` queues up undelivered. That asymmetry makes it a nasty failure to
-   spot.
+   **`PUBLIC_BASE_URL` and `TELEGRAM_WEBHOOK_SECRET` are a pair — set both.**
+   They fail the same way, and it is a nasty way: Telegram *inbound* silently
+   dies while alarms keep arriving, because outbound needs no webhook at all.
+   Every button press, `/start` and `/stop` is dropped; nothing else looks
+   wrong.
+
+   - No `PUBLIC_BASE_URL`: the app cannot know its own address and falls back to
+     polling, which a function cannot do.
+   - No `TELEGRAM_WEBHOOK_SECRET`: the webhook URL is public and guessable, so
+     the endpoint trusts nobody and answers every update `503`.
+
+   Both are checked on the once-a-minute `alarm-tick` cron, which re-registers
+   the webhook when either changes — including the first time you add the
+   secret. The **Alarms** panel shows a red banner whenever inbound is blocked,
+   and `getWebhookInfo` tells you directly:
+
+   ```bash
+   curl -s "https://api.telegram.org/bot<TOKEN>/getWebhookInfo" | python3 -m json.tool
+   # "last_error_message": "Wrong response from the webhook: 503 Service Unavailable"
+   #   -> TELEGRAM_WEBHOOK_SECRET is missing on the host
+   ```
 5. **Deploy**, then open the site, paste the bot token in **Alarms** and the
    session token in **Settings**. Saving the bot token registers the webhook at
    `https://<your-site>/api/telegram/webhook` automatically — the panel confirms

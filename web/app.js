@@ -909,7 +909,26 @@ async function renderAlarms() {
   const done = alerts.filter((a) => a.status !== 'active').slice(0, 8);
   const TEST_DELAY = status.testDelaySeconds ?? 15;
 
+  const inbound = status.inboundBlocked
+    ? `<div class="note danger">
+        <b>Buttons and commands are not reaching the bot.</b>
+        <br>${esc(status.inboundBlocked)}.
+        <br>Alarms will still ring — only <b>Stop alarm</b>, <code>/start</code> and
+        <code>/stop</code> are affected. Set it in your hosting environment variables,
+        redeploy, and it repairs itself within a minute.
+      </div>`
+    : status.webhook?.lastError
+      ? `<div class="note warn">
+          <b>Telegram could not deliver the last update</b> to
+          ${esc(status.webhook.url || 'the webhook')}:
+          <br><code>${esc(status.webhook.lastError)}</code>${status.webhook.lastErrorAt
+            ? ` (${esc(dhakaDateTime(status.webhook.lastErrorAt))})` : ''}
+          ${status.webhook.pending ? `<br>${status.webhook.pending} update(s) queued.` : ''}
+        </div>`
+      : '';
+
   body.innerHTML = `
+    ${inbound}
     <div class="note ok">
       <b>Connected to Telegram</b>${status.subscriber?.displayName ? ` — ${esc(status.subscriber.displayName)}` : ''}
       <br>${active} of ${limit} alarm${limit === 1 ? '' : 's'} in use.
