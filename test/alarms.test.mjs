@@ -52,8 +52,10 @@ mock.module(path.join(SRC, 'telegram.js'), {
 const { migrate, query, one, closePool } = await import(path.join(SRC, 'db.js'));
 const { addDays, todayISO } = await import(path.join(SRC, 'time.js'));
 const notify = await import(path.join(SRC, 'notify.js'));
-const { ADVANCE_DAYS, MAX_ALERTS_PER_SUBSCRIBER, ALARM_RING_INTERVAL_MS, ALARM_TRIGGER_TAG } =
-  await import(path.join(SRC, 'config.js'));
+const {
+  ADVANCE_DAYS, MAX_ALERTS_PER_SUBSCRIBER, ALARM_RING_INTERVAL_MS, ALARM_TRIGGER_TAG,
+  SALE_OPEN_TIME,
+} = await import(path.join(SRC, 'config.js'));
 
 await migrate();
 
@@ -112,7 +114,7 @@ test('refuses a route with no direct train', async () => {
   );
 });
 
-test('freezes the sale instant at midnight Dhaka, ADVANCE_DAYS ahead', async () => {
+test('freezes the sale instant at the release time, ADVANCE_DAYS ahead', async () => {
   const date = futureDate(3);
   const alert = await notify.createAlert({
     subscriber, fromCity: 'Dhaka', toCity: 'Sreemangal', dateISO: date,
@@ -126,7 +128,10 @@ test('freezes the sale instant at midnight Dhaka, ADVANCE_DAYS ahead', async () 
   const get = (t) => inDhaka.find((p) => p.type === t).value;
 
   assert.equal(`${get('year')}-${get('month')}-${get('day')}`, addDays(date, -ADVANCE_DAYS));
-  assert.equal(`${get('hour')}:${get('minute')}`, '00:00', 'opens at Dhaka midnight');
+  // Midnight is when the date becomes selectable; the seats land later that
+  // morning, and that is the moment worth alarming on.
+  assert.equal(`${get('hour')}:${get('minute')}`, SALE_OPEN_TIME.slice(0, 5),
+    'opens at the seat-release time, not midnight');
 
   await notify.cancelAlert(subscriber.id, alert.id);
 });

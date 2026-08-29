@@ -203,7 +203,17 @@ export async function answerCallback(callbackQueryId, text = '') {
  * one update at a time; a throwing handler is logged and skipped so one bad
  * update cannot wedge the loop.
  */
-export function startTelegramListener({ getOffset, setOffset, onMessage, onCallback, log = console.log }) {
+/**
+ * @param {function(): Promise<boolean>} [isWebhookMode] Whether updates are
+ *   being delivered to a webhook somewhere else. Polling and webhooks are
+ *   mutually exclusive, so when this is true the loop must NOT clear the
+ *   webhook and must NOT poll — otherwise running this locally against a
+ *   production database silently kills the deployed site's inbound updates.
+ */
+export function startTelegramListener({
+  getOffset, setOffset, onMessage, onCallback, isWebhookMode = async () => false,
+  log = console.log,
+}) {
   let stopped = false;
   let backoffMs = 1_000;
   // Tracks which token we last announced, so adding, swapping or removing a
@@ -222,6 +232,16 @@ export function startTelegramListener({ getOffset, setOffset, onMessage, onCallb
           announced = null;
         }
         await sleep(3_000); // Idle until a token is saved in the UI.
+        continue;
+      }
+
+      if (await isWebhookMode()) {
+        if (announced !== 'webhook') {
+          log('telegram: a webhook is registered elsewhere (a deployed site) — not polling, '
+            + 'and leaving it alone. Set TELEGRAM_POLLING=1 to take over locally.');
+          announced = 'webhook';
+        }
+        await sleep(10_000);
         continue;
       }
 

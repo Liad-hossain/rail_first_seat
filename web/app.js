@@ -54,6 +54,49 @@ function ampm(hhmm) {
   return `${hr}:${String(m).padStart(2, '0')} ${suffix}`;
 }
 
+/**
+ * Bangladesh Standard Time, always.
+ *
+ * Every sale instant the API returns is a UTC ISO string (08:00 BST is
+ * 02:00Z), so rendering one with plain toLocaleString() prints the VIEWER's
+ * clock — 2 AM for anyone on UTC — while the countdown next to it ticks down
+ * to the Dhaka moment. The sale happens on Bangladesh's clock, so that is the
+ * only clock the UI quotes, whoever is looking.
+ */
+const DHAKA = 'Asia/Dhaka';
+
+/** "8:00 AM BST" from a UTC ISO instant. */
+function dhakaTime(iso) {
+  if (!iso) return '—';
+  const t = new Date(iso);
+  if (Number.isNaN(t.getTime())) return '—';
+  return `${new Intl.DateTimeFormat('en-US', {
+    timeZone: DHAKA, hour: 'numeric', minute: '2-digit', hour12: true,
+  }).format(t)} BST`;
+}
+
+/** "5 Sep 2026, 8:00 AM BST" from a UTC ISO instant. */
+function dhakaDateTime(iso) {
+  if (!iso) return '—';
+  const t = new Date(iso);
+  if (Number.isNaN(t.getTime())) return '—';
+  // Assembled from parts rather than a locale date style so the month reads
+  // "Sep" like everywhere else here, not the en-GB "Sept".
+  const p = Object.fromEntries(new Intl.DateTimeFormat('en-GB', {
+    timeZone: DHAKA, day: 'numeric', month: 'numeric', year: 'numeric',
+  }).formatToParts(t).map((x) => [x.type, x.value]));
+  return `${Number(p.day)} ${MONTH_ABBR[Number(p.month) - 1]} ${p.year}, ${dhakaTime(iso)}`;
+}
+
+/** "8:00 AM BST" from a bare "HH:MM" Dhaka wall-clock time. */
+const saleClock = (hhmm) => (hhmm ? `${ampm(hhmm)} BST` : '—');
+
+/**
+ * The release time in force, for sections with no search result to read it
+ * from. Same value the server schedules alarms on, so nothing can drift.
+ */
+const metaSaleOpen = () => state.meta?.saleOpen || null;
+
 function splitDuration(ms) {
   const t = Math.max(0, Math.floor(ms / 1000));
   return {
@@ -236,12 +279,16 @@ function renderAnswer(r) {
     return `
       <div class="answer is-pending" data-countdown="${esc(fa.opensAtISO)}">
         <span class="answer-kicker">${ICON.bell} Not on sale yet</span>
-        <h2>Tickets go on sale at the start of ${esc(fa.openDatePretty)}</h2>
+        <h2>Tickets go on sale at ${esc(saleClock(fa.openTime))} on ${esc(fa.openDatePretty)}</h2>
         <p>
           For travel on <b>${esc(r.datePretty)}</b> from ${esc(r.from.label)} to ${esc(r.to.label)}.
-          Bangladesh Railway sells a rolling ${r.window.advanceDays}-day window, so this date
-          becomes bookable the moment ${esc(shortDate(fa.openDate))} begins in Bangladesh —
-          <b>midnight BST</b>, not later in the day. Be logged in and on the search page a minute
+          Bangladesh Railway sells a rolling ${r.window.advanceDays}-day window, so
+          ${esc(shortDate(fa.openDate))} is when this date can first be bought. The date becomes
+          selectable at midnight BST, but the seats themselves are released at
+          <b>${esc(saleClock(fa.openTime))}</b> — the countdown below runs to that moment${
+            fa.openTimeSource === 'measured'
+              ? ', measured from live seat data'
+              : ''}. Be logged in and on the search page a minute
           early — popular ${esc(r.to.label)} trains can sell out within minutes.
         </p>
         <div class="countdown" id="countdown">
@@ -250,7 +297,7 @@ function renderAnswer(r) {
         </div>
         <div class="stat-row">
           <div class="stat"><b>${r.trainsRunningOnDate}</b><span>trains running that day</span></div>
-          <div class="stat"><b>${esc(shortDate(fa.openDate))}</b><span>on sale from (12 AM BST)</span></div>
+          <div class="stat"><b>${esc(shortDate(fa.openDate))}</b><span>on sale from (${esc(saleClock(fa.openTime))})</span></div>
           <div class="stat"><b>${r.dateStatus.offset}</b><span>days until travel</span></div>
         </div>
         <div class="answer-actions">
@@ -297,7 +344,7 @@ function renderAnswer(r) {
       <span class="answer-kicker">On sale now</span>
       <h2>Tickets for ${esc(r.datePretty)} are already on sale</h2>
       <p>
-        They opened at the start of <b>${esc(fa.openDatePretty)}</b>, and
+        They opened at <b>${esc(saleClock(fa.openTime))}</b> on <b>${esc(fa.openDatePretty)}</b>, and
         ${r.trainsRunningOnDate} train${r.trainsRunningOnDate === 1 ? '' : 's'} run
         ${esc(r.from.label)} → ${esc(r.to.label)} that day. ${why}
       </p>
@@ -374,7 +421,7 @@ function renderTrain(t, r) {
         ${ICON.chevron} Full route &amp; stop times
       </button>
       <span class="grow"></span>
-      <span>Sale opens ${esc(shortDate(r.firstAvailability?.openDatePretty || t.sale.openDate))}, 12:00 AM · ${esc(t.zone)} zone counters ${esc(ampm(t.sale.zoneOpenTime))}</span>
+      <span>Sale opens ${esc(shortDate(r.firstAvailability?.openDatePretty || t.sale.openDate))}, ${esc(saleClock(t.sale.openTime))} · ${esc(t.zone)} zone counters ${esc(ampm(t.sale.zoneOpenTime))} (counter sales only)</span>
       <a class="btn btn-ghost btn-sm" href="${esc(t.bookingUrl)}" target="_blank" rel="noopener">${ICON.ext} Book</a>
     </div>
 
@@ -580,7 +627,8 @@ async function loadCalendar(q) {
         <div class="cal-strip">
           ${days.map((d) => `
             <button class="cal-day st-${d.trainsRunning ? d.status : 'none'} ${d.date === q.date ? 'sel' : ''}"
-                    type="button" data-cal-date="${esc(d.date)}">
+                    type="button" data-cal-date="${esc(d.date)}"
+                    title="${d.saleOpensAt ? `Seats released ${esc(dhakaDateTime(d.saleOpensAt))}` : 'No train runs this route'}">
               <div class="cd-date">${esc(d.datePretty.replace(/,.*$/, ''))}</div>
               <div class="cd-wd">${esc(d.weekday)}</div>
               <div class="cd-note">${
@@ -883,7 +931,7 @@ async function renderAlarms() {
         <div class="watch-item${a.isTest ? ' is-test' : ''}">
           <span class="grow">
             <b>${a.isTest ? '🔔 Test alarm — ' : ''}${esc(a.fromLabel)} → ${esc(a.toLabel)}</b>
-            <small>${a.isTest ? 'drill, no slot used' : `travel ${esc(a.journeyDatePretty)}`} · rings <span class="alarm-when" data-opens="${esc(a.opensAt)}">${esc(new Date(a.opensAt).toLocaleString())}</span></small>
+            <small>${a.isTest ? 'drill, no slot used' : `travel ${esc(a.journeyDatePretty)}`} · rings <span class="alarm-when" data-opens="${esc(a.opensAt)}">${esc(dhakaDateTime(a.opensAt))}</span></small>
           </span>
           <button class="chip" data-cancel-alarm="${a.id}">Cancel</button>
         </div>`).join('')
@@ -897,15 +945,20 @@ async function renderAlarms() {
         <div class="watch-item">
           <span class="grow">
             <b>${a.isTest ? '🔔 Test — ' : ''}${esc(a.fromLabel)} → ${esc(a.toLabel)}</b>
-            <small>${esc(a.journeyDatePretty)} · ${esc(a.status)}${a.firedAt ? ` ${esc(new Date(a.firedAt).toLocaleString())}` : ''}${a.lastError ? ` · ${esc(a.lastError)}` : ''}</small>
+            <small>${esc(a.journeyDatePretty)} · ${esc(a.status)}${a.firedAt ? ` ${esc(dhakaDateTime(a.firedAt))}` : ''}${a.lastError ? ` · ${esc(a.lastError)}` : ''}</small>
           </span>
         </div>`).join('')}` : ''}
 
     <h3>How it fires</h3>
-    <p>Bangladesh Railway opens a journey date at <b>midnight Bangladesh time</b>, exactly
-    ${state.meta?.window?.advanceDays ?? 10} days ahead. That moment is known in advance, so the
-    alarm is scheduled on it rather than polled for — it rings on the second, with no session
-    token needed.</p>
+    <p>Bangladesh Railway releases a journey date's seats at
+    <b>${esc(saleClock(metaSaleOpen()?.time))}</b>, exactly
+    ${state.meta?.window?.advanceDays ?? 10} days ahead — the date turns selectable at midnight,
+    but the seats appear later that morning, so an alarm at midnight would wake you for an empty
+    page. That moment is known in advance, so the alarm is scheduled on it rather than polled for
+    — it rings on the second, with no session token needed.</p>
+    <p class="fine">${metaSaleOpen()?.source === 'measured'
+      ? `That time was <b>measured</b> from live seat data${metaSaleOpen()?.measuredAt ? ` (seats first seen at ${esc(metaSaleOpen().measuredAt)} Dhaka)` : ''}, not assumed.`
+      : 'Bangladesh Railway does not publish this time, so it starts from the documented default and is corrected automatically the first time the app watches seats appear.'}</p>
     <p class="fine">${status.repeats
       ? `It re-rings every ${status.ringIntervalSeconds ?? 10} seconds for up to ${status.ringMinutes ?? 15} minutes until you tap <b>Stop alarm</b>.`
       : 'You get <b>one</b> message per alarm — the ringing is your phone\'s job (below), so repeats would only clutter the chat. Delivery is retried behind the scenes if Telegram is slow, but only ever one message arrives.'}

@@ -3,7 +3,7 @@
  *
  * You can only ask for an alarm on a journey date that is NOT yet buyable, and
  * that is the whole point: the sale instant for such a date is deterministic
- * (midnight Dhaka on D - ADVANCE_DAYS, see config.js), so the alarm needs no
+ * (the release time on D - ADVANCE_DAYS — see effectiveSaleOpenTime), so the alarm needs no
  * polling, no session token, and no luck. The moment is frozen onto the row at
  * creation and a timer fires on it to the millisecond.
  *
@@ -22,13 +22,13 @@ import {
   ALARM_TEST_DURATION_MS, TEST_ALARM_DELAY_SECONDS, TEST_ALARM_MAX_DELAY_SECONDS,
 } from './config.js';
 import { query, one, transact, isoTimestamp, getMeta, setMeta } from './db.js';
-import { routePlan } from './availability.js';
+import { routePlan, effectiveSaleOpenTime } from './availability.js';
 import { stationLabel } from './catalog.js';
 import { bookingUrl } from './shohoz.js';
-import { addDays, prettyDate, todayISO, daysBetween } from './time.js';
+import { addDays, prettyDate, todayISO, daysBetween, dhakaToUTC } from './time.js';
 import {
   botConfigured, getBot, sendMessage, answerCallback, startTelegramListener,
-  setBotTokenProvider, clearWebhookIfSet, setWebhook, deleteMessage,
+  setBotTokenProvider, clearWebhookIfSet, setWebhook, getWebhookInfo, deleteMessage,
   editMessageText, esc,
 } from './telegram.js';
 
@@ -52,6 +52,47 @@ const newToken = () => crypto.randomBytes(24).toString('base64url');
  * TELEGRAM_BOT_TOKEN stays as a fallback for a deployment that would rather
  * inject it as a secret; whatever is in the database wins.
  * ------------------------------------------------------------------ */
+
+/** Which delivery mode the bot was last configured for. */
+export const DELIVERY_MODE_KEY = 'telegram_delivery_mode';
+
+export function webhookUrl() {
+  return `${PUBLIC_BASE_URL.replace(/\/+$/, '')}/api/telegram/webhook`;
+}
+
+/** True when updates are being pushed to a webhook rather than polled. */
+export async function webhookIsInCharge() {
+  return (await getMeta(DELIVERY_MODE_KEY)) === 'webhook';
+}
+
+/**
+ * Put the webhook back if it has gone missing.
+ *
+ * A webhook can be cleared by anything that polls the same bot — most easily a
+ * developer running the server locally against the production database. The
+ * symptom is subtle and one-directional: outbound messages still arrive, so
+ * alarms look fine, while every button press and /start silently queues up
+ * undelivered. Cheap enough to check on the same cron that fires alarms.
+ */
+export async function ensureWebhook({ log = () => {} } = {}) {
+  if (!WEBHOOK_MODE) return { skipped: 'not in webhook mode' };
+  if (!(await botConfigured())) return { skipped: 'no bot token' };
+
+  const want = webhookUrl();
+  let info;
+  try {
+    info = await getWebhookInfo();
+  } catch (err) {
+    return { skipped: `could not read webhook info: ${err.message}` };
+  }
+  if (info?.url === want) return { ok: true, url: want, pending: info.pending_update_count };
+
+  await setWebhook(want, { secret: TELEGRAM_WEBHOOK_SECRET || null });
+  await setMeta(DELIVERY_MODE_KEY, 'webhook');
+  log(`telegram: webhook was ${info?.url ? `pointing at ${info.url}` : 'missing'} — re-registered at ${want}`
+    + (info?.pending_update_count ? ` (${info.pending_update_count} queued update(s) will now be delivered)` : ''));
+  return { repaired: true, url: want, was: info?.url || null, pending: info?.pending_update_count ?? 0 };
+}
 
 export async function getBotToken() {
   return (await getMeta('telegram_bot_token')) || TELEGRAM_BOT_TOKEN || null;
@@ -120,11 +161,14 @@ export async function setBotToken(token) {
   // only symptom would be "pressing Start does nothing".
   let webhook = { had: false };
   if (WEBHOOK_MODE) {
-    const url = `${PUBLIC_BASE_URL.replace(/\/+$/, '')}/api/telegram/webhook`;
-    await setWebhook(url, { secret: TELEGRAM_WEBHOOK_SECRET || null, token: trimmed });
-    webhook = { registered: url };
+    await setWebhook(webhookUrl(), { secret: TELEGRAM_WEBHOOK_SECRET || null, token: trimmed });
+    webhook = { registered: webhookUrl() };
+    // Remembered so a local `npm start` against this same database can tell
+    // that a webhook is legitimately in charge and leave it alone.
+    await setMeta(DELIVERY_MODE_KEY, 'webhook');
   } else {
     webhook = await clearWebhookIfSet({ token: trimmed });
+    await setMeta(DELIVERY_MODE_KEY, 'polling');
   }
 
   const previous = await getMeta('telegram_bot_token');
@@ -158,6 +202,7 @@ export async function notifyStatus() {
     ringMinutes: Math.round(ALARM_MAX_DURATION_MS / 60_000),
     triggerTag: ALARM_TRIGGER_TAG,
     delivery: WEBHOOK_MODE ? 'webhook' : 'polling',
+    publicBaseUrl: PUBLIC_BASE_URL || null,
     token: await botTokenInfo(),
   };
   if (!(await botConfigured())) return { ...base, configured: false, botUsername: null };
@@ -862,6 +907,31 @@ export function startAlertScheduler({ log = console.log } = {}) {
 
 /** Boot both halves: the update listener and the scheduler. */
 /**
+ * Re-freeze every pending alarm onto the current release time.
+ *
+ * opens_at is stored on the row so the scheduler stays a plain index scan, but
+ * that means a change in the release time — a measurement landing, or the
+ * default being corrected — would otherwise leave existing alarms pointing at
+ * the old instant. Cheap, and idempotent.
+ */
+export async function resyncAlertOpenTimes({ log = () => {} } = {}) {
+  const openTime = await effectiveSaleOpenTime();
+  const rows = await query(
+    "SELECT id, journey_date, opens_at FROM alerts WHERE status = 'active'",
+  );
+
+  let moved = 0;
+  for (const r of rows) {
+    const want = dhakaToUTC(addDays(r.journey_date, -ADVANCE_DAYS), openTime);
+    if (Math.abs(want.getTime() - new Date(r.opens_at).getTime()) < 1000) continue;
+    await query('UPDATE alerts SET opens_at = $2 WHERE id = $1', [r.id, want.toISOString()]);
+    moved += 1;
+  }
+  if (moved) log(`alarms: re-timed ${moved} pending alarm(s) to ${openTime} Dhaka`);
+  return { checked: rows.length, moved, openTime };
+}
+
+/**
  * One pass of the alarm work, with no timers left behind.
  *
  * The long-running scheduler arms a precise setTimeout and is accurate to the
@@ -874,6 +944,8 @@ export function startAlertScheduler({ log = console.log } = {}) {
  */
 export async function runAlarmTick({ log = console.log, waitWindowMs = 5_000 } = {}) {
   const out = { expired: 0, fired: 0, retried: 0, waitedMs: 0 };
+
+  await resyncAlertOpenTimes({ log });
 
   const expired = await query(
     "UPDATE alerts SET status = 'expired' WHERE status = 'active' AND journey_date < $1 RETURNING id",
@@ -938,6 +1010,8 @@ export function startNotifications({ log = console.log } = {}) {
   const listener = startTelegramListener({
     getOffset: () => getMeta('telegram_update_offset', '0'),
     setOffset: (v) => setMeta('telegram_update_offset', v),
+    // Never hijack a deployment's webhook by polling the same bot.
+    isWebhookMode: () => (WEBHOOK_MODE ? Promise.resolve(false) : webhookIsInCharge()),
     onMessage: makeMessageHandler(log),
     onCallback: makeCallbackHandler(log),
     log,

@@ -11,7 +11,7 @@ and you get nothing at all. This site answers for any date, months ahead.
 ```
 Dhaka → Sreemangal, 15 Oct 2026
 
-  Tickets go on sale at the start of 5 Oct 2026, Mon [39d 14h 33m countdown]
+  Tickets go on sale 5 Oct 2026, Mon at 8:00 AM BST [39d 14h 33m countdown]
 
   709  PARABAT EXPRESS    06:30 → 10:32   4h 2m   6 stops   off day Mon
   717  JAYENTIKA EXPRESS  11:15 → 16:01   4h 46m  10 stops  off day Tue
@@ -148,10 +148,22 @@ snippets do. For full verification, download Supabase's CA certificate
 
 ## What it tells you
 
-**1. When the sale opens.** Bangladesh Railway sells a rolling window of journey
-dates — today through today + 10 — so a date becomes bookable the moment the day
-10 days before it *begins* in Bangladesh: midnight BST, not the zone counter
-hour. The site computes the exact moment for your date, shows a live
+**1. When the sale opens.** Two moments are easy to confuse, and only the second
+one lets you buy anything:
+
+- The booking **window** rolls forward at **00:00 Dhaka** on D-10. That is when
+  the date appears in the official datepicker — verified in the site's own JS,
+  which feeds `trip_search_day_limit: 10` straight to `maxDate`.
+- The **seats** are released later that morning, at **08:00 Dhaka**. Before
+  that the date is selectable but every train shows nothing.
+
+Alarms fire on the second. The exact release time is not published anywhere and
+has moved before, so the app does not merely trust the default: once a session
+token is present it **measures** the release each day by watching the newest
+journey date, and the measured value then drives every alarm (`observed_sale_open_time`
+in `meta`; see `probeSaleRelease` in `src/history.js`). Pending alarms are
+re-timed automatically when a measurement lands. The site computes the exact
+moment for your date, shows a live
 countdown, and hands you an `.ics` reminder with a 10-minute alarm so you are
 logged in and on the search page before it opens.
 
@@ -428,11 +440,15 @@ strictly worse than running a persistent process.
    | --- | --- |
    | `SUPABASE_DB_URL` | the pooler URI from step 1 |
    | `TELEGRAM_WEBHOOK_SECRET` | any random string — `node -e "console.log(require('crypto').randomBytes(24).toString('base64url'))"` |
+   | `PUBLIC_BASE_URL` | your site's https origin, e.g. `https://your-site.netlify.app` |
    | `NODE_ENV` | `production` |
    | `PG_SSL_MODE` | `require` |
 
-   `PUBLIC_BASE_URL` is optional: Netlify injects `URL` and the code falls back
-   to it. Set it explicitly if you use a custom domain.
+   **Set `PUBLIC_BASE_URL` explicitly.** Without it the app cannot know its own
+   address, falls back to polling mode, and Telegram *inbound* silently dies —
+   alarms still arrive (outbound needs no webhook) while every button press and
+   `/start` queues up undelivered. That asymmetry makes it a nasty failure to
+   spot.
 5. **Deploy**, then open the site, paste the bot token in **Alarms** and the
    session token in **Settings**. Saving the bot token registers the webhook at
    `https://<your-site>/api/telegram/webhook` automatically — the panel confirms
@@ -451,6 +467,12 @@ strictly worse than running a persistent process.
   current limit before relying on it.
 - If you later move back to a persistent host, set `TELEGRAM_POLLING=1` and
   re-save the bot token — it clears the webhook and returns to long-polling.
+- **Do not run `npm start` locally against the deployed database** without
+  `TELEGRAM_POLLING=1`. Polling and webhooks are mutually exclusive, and a
+  local run used to clear the deployed webhook the moment it saw the token.
+  The listener now detects that a webhook is in charge (recorded in
+  `meta.telegram_delivery_mode`), refuses to poll and leaves it alone, and the
+  alarm cron re-registers the webhook if it ever goes missing.
 
 ---
 
@@ -524,6 +546,13 @@ upstream form (`Biman_Bandar`).
 - The 10-day window is Bangladesh Railway policy and can change. It lives in
   `src/config.js` (`ADVANCE_DAYS`), and matches what the official site reads
   from its own `/handshake` config (`trip_search_day_limit`).
+- The **seat-release time** (`SALE_OPEN_TIME`, default `08:00:00`) is the one
+  number here that is inferred rather than documented. It is bounded by direct
+  observation — seats are absent at 00:00 and present by 11:15 — and 08:00 is
+  the only clock time Bangladesh Railway publishes in that range. The probe
+  exists precisely because that reasoning could be wrong: it replaces the guess
+  with a measurement as soon as one is available. Override with
+  `BR_SALE_OPEN_TIME=HH:MM:SS` if you know better.
 - The 08:00 / 14:00 zone opening times (`ZONE_OPENING_TIME`, and the per-train
   `opening_time` read live from upstream) are the operator's published counter
   hours and are shown for information only. They do **not** gate when a date

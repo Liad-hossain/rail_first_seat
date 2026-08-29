@@ -6,10 +6,13 @@
  * The routes themselves live in src/server.js.
  */
 import http from 'node:http';
-import { PORT, NODE_ENV } from './config.js';
+import { PORT, NODE_ENV, SALE_OPEN_TIME } from './config.js';
 import { migrate, verifyConnection, catalogIsEmpty, closePool } from './db.js';
 import { catalogStatus, stationLabel } from './catalog.js';
-import { historyOverview, listWatches, addWatch, startCollector } from './history.js';
+import {
+  historyOverview, listWatches, addWatch, startCollector, startReleaseProbe,
+  saleReleaseEvidence,
+} from './history.js';
 import { notifyStatus, startNotifications } from './notify.js';
 import { setDeviceIdentity } from './shohoz.js';
 import {
@@ -94,8 +97,8 @@ async function start() {
   // only accepted alongside the device it was issued to.
   setDeviceIdentity(await getDeviceIdentity());
 
-  const [catalog, token, overview, notify] = await Promise.all([
-    catalogStatus(), getToken(), historyOverview(), notifyStatus(),
+  const [catalog, token, overview, notify, release] = await Promise.all([
+    catalogStatus(), getToken(), historyOverview(), notifyStatus(), saleReleaseEvidence(),
   ]);
 
   server.listen(PORT, () => {
@@ -105,6 +108,10 @@ async function start() {
       (catalog.syncedAt ? ` (synced ${catalog.syncedAt})` : ''));
     console.log(`  session : ${token ? 'token present — live seat counts enabled' : 'no token — schedules and sale times only'}`);
     console.log(`  history : ${overview.snapshots} snapshot(s) recorded`);
+    console.log(`  release : seats open ${release.time || SALE_OPEN_TIME} Dhaka`
+      + (release.evidence
+        ? ` (measured ${release.evidence.observedOn})`
+        : ' (default — will self-correct once a session token lets it be measured)'));
     console.log(`  alarms  : ${notify.configured
       ? `Telegram @${notify.botUsername} — sale-open alarms enabled`
       : 'no bot connected yet — add one in Settings to enable alarms'}\n`);
@@ -138,6 +145,7 @@ async function start() {
   }
 
   startCollector({ getToken, log: (m) => console.log(`  ${m}`) });
+  startReleaseProbe({ getToken, log: (m) => console.log(`  ${m}`) });
   startNotifications({ log: (m) => console.log(`  ${m}`) });
 }
 

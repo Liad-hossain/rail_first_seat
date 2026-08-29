@@ -12,10 +12,14 @@
  *   - which trains/classes on a route historically still have seats late
  *   - month-by-month coverage of what has been captured so far
  */
-import { query, one, transact, isoDate, isoTimestamp } from './db.js';
+import { query, one, transact, isoDate, isoTimestamp, getMeta, setMeta } from './db.js';
 import { liveAvailability, bookingWindow } from './availability.js';
 import { findTrainsForRoute, stationLabel } from './catalog.js';
-import { addDays, daysBetween, todayISO, prettyDate, weekdayShort } from './time.js';
+import { addDays, daysBetween, todayISO, prettyDate, weekdayShort, nowInDhaka } from './time.js';
+import {
+  ADVANCE_DAYS, TZ, PROBE_INTERVAL_MS, PROBE_FROM_HOUR, PROBE_TO_HOUR,
+  SALE_OPEN_TIME_KEY, SALE_OPEN_EVIDENCE_KEY,
+} from './config.js';
 import { UpstreamError } from './shohoz.js';
 
 /** Persist one observation of a route+date. Returns the snapshot id. */
@@ -319,6 +323,29 @@ export async function collectOnce({ token, log = () => {} }) {
 }
 
 /** Start the hourly collector. Returns a stop function. */
+/**
+ * The release probe runs on its own, much shorter, interval: an hourly sweep
+ * could only ever place the release within an hour, which is useless for an
+ * alarm. It no-ops outside the watch hours and once the day is measured.
+ */
+export function startReleaseProbe({ getToken, log = console.log }) {
+  const tick = async () => {
+    try {
+      const res = await probeSaleRelease({ token: await getToken(), log });
+      if (res.measured) {
+        const { resyncAlertOpenTimes } = await import('./notify.js');
+        await resyncAlertOpenTimes({ log });
+      }
+    } catch (err) {
+      log(`release probe: ${err.message}`);
+    }
+  };
+  const timer = setInterval(tick, PROBE_INTERVAL_MS);
+  timer.unref?.();
+  setTimeout(tick, 5_000).unref?.();
+  return { stop() { clearInterval(timer); } };
+}
+
 export function startCollector({ getToken, intervalMs = 60 * 60 * 1000, log = console.log }) {
   let running = false;
   const tick = async () => {
@@ -339,4 +366,82 @@ export function startCollector({ getToken, intervalMs = 60 * 60 * 1000, log = co
   timer.unref?.();
   setTimeout(tick, 10_000).unref?.(); // first sweep shortly after boot
   return () => clearInterval(timer);
+}
+
+/* ------------------------------------------------------------------ *
+ * Sale-release probe
+ *
+ * The exact time of day Bangladesh Railway releases seats is not published
+ * anywhere and has moved before, so rather than hard-code a guess the app
+ * measures it: on each day, watch the NEWEST journey date (today + 10, which
+ * became selectable at midnight but has no seats yet) and record the first
+ * moment seats appear. That timestamp then drives every alarm.
+ * ------------------------------------------------------------------ */
+
+/**
+ * One observation. Cheap enough to call every minute: it does nothing outside
+ * the watch hours, nothing once today's release has been seen, and nothing
+ * without a session token.
+ */
+export async function probeSaleRelease({ token, log = () => {} }) {
+  if (!token) return { skipped: 'no token' };
+
+  const { y, m, d, hh } = nowInDhaka();
+  const todayDhaka = `${y}-${String(m).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
+  if (hh < PROBE_FROM_HOUR || hh >= PROBE_TO_HOUR) return { skipped: 'outside watch hours' };
+
+  // Already measured today? Nothing left to learn until tomorrow.
+  const evidence = JSON.parse((await getMeta(SALE_OPEN_EVIDENCE_KEY)) || 'null');
+  if (evidence?.observedOn === todayDhaka) return { skipped: 'already seen today' };
+
+  const watches = await listWatches();
+  if (!watches.length) return { skipped: 'no tracked routes' };
+  const { fromCity, toCity } = watches[0];
+
+  // The newest date is the one whose seats have not been released yet.
+  const dateISO = addDays(todayDhaka, ADVANCE_DAYS);
+
+  let live;
+  try {
+    live = await liveAvailability({ fromCity, toCity, dateISO, token });
+  } catch (err) {
+    return { skipped: `lookup failed: ${err.message}` };
+  }
+
+  if (live.onlineSeats <= 0) return { seatsYet: false, dateISO };
+
+  // First sighting of the day. The true release is somewhere in the interval
+  // since the previous check, so record that interval honestly rather than
+  // pretending this instant is exact.
+  const at = new Date();
+  const observed = {
+    observedOn: todayDhaka,
+    journeyDate: dateISO,
+    route: `${fromCity} > ${toCity}`,
+    seenAt: at.toISOString(),
+    seenAtDhaka: new Intl.DateTimeFormat('en-GB', {
+      timeZone: TZ, hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false,
+    }).format(at),
+    onlineSeats: live.onlineSeats,
+    resolutionMs: PROBE_INTERVAL_MS,
+  };
+
+  // Round down to the minute: the release is a scheduled clock time, and the
+  // sighting can only be at or after it.
+  const [oh, om] = observed.seenAtDhaka.split(':');
+  const measured = `${oh}:${om}:00`;
+
+  await setMeta(SALE_OPEN_EVIDENCE_KEY, JSON.stringify(observed));
+  await setMeta(SALE_OPEN_TIME_KEY, measured);
+  log(`sale release measured: seats for ${dateISO} appeared by ${observed.seenAtDhaka} Dhaka `
+    + `(${observed.onlineSeats} seats, ±${Math.round(PROBE_INTERVAL_MS / 1000)}s) — alarms now use ${measured}`);
+
+  return { measured, observed };
+}
+
+/** What the probe has learned, for the UI. */
+export async function saleReleaseEvidence() {
+  const raw = await getMeta(SALE_OPEN_EVIDENCE_KEY);
+  const time = await getMeta(SALE_OPEN_TIME_KEY);
+  return { time: time || null, evidence: raw ? JSON.parse(raw) : null };
 }

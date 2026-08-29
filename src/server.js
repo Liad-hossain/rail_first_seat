@@ -24,10 +24,13 @@ import { migrate, verifyConnection, getMeta, setMeta, catalogIsEmpty, closePool 
 import {
   syncCatalog, catalogStatus, listStations, destinationsFrom, trainDetail, stationLabel,
 } from './catalog.js';
-import { fullAvailability, earliestBookable, liveAvailability, bookingWindow, routePlan } from './availability.js';
+import {
+  fullAvailability, earliestBookable, liveAvailability, bookingWindow, routePlan,
+  effectiveSaleOpenTime, saleOpenTimeSource,
+} from './availability.js';
 import {
   recordSnapshot, addWatch, removeWatch, listWatches, historyOverview,
-  journeyDateHistory, routeHistory, startCollector, collectOnce,
+  journeyDateHistory, routeHistory, startCollector, collectOnce, saleReleaseEvidence,
 } from './history.js';
 import {
   checkToken, bookingUrl, UpstreamError,
@@ -293,8 +296,9 @@ async function runSync() {
 
 const handlers = {
   'GET /api/meta': async () => {
-    const [catalog, token, overview] = await Promise.all([
+    const [catalog, token, overview, saleOpenTime, release] = await Promise.all([
       catalogStatus(), tokenInfo(), historyOverview(),
+      effectiveSaleOpenTime(), saleReleaseEvidence(),
     ]);
     return {
       catalog,
@@ -302,6 +306,17 @@ const handlers = {
       window: bookingWindow(),
       advanceDays: ADVANCE_DAYS,
       today: todayISO(),
+      /**
+       * The single source of truth for every "when do seats appear" string in
+       * the UI. Sections that have no search result to read it from (the alarm
+       * explainer, for one) used to hard-code midnight and disagreed with the
+       * countdown; they read this instead.
+       */
+      saleOpen: {
+        time: saleOpenTime.slice(0, 5),
+        source: saleOpenTimeSource(),
+        measuredAt: release.evidence?.seenAtDhaka || null,
+      },
       seatClasses: SEAT_CLASSES.map((c) => ({ code: c, label: SEAT_CLASS_LABELS[c] || c })),
       officialSite: SITE_BASE,
       sync: { running: syncState.running, done: syncState.done, total: syncState.total },

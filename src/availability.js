@@ -17,7 +17,10 @@
  *  C. What is the EARLIEST DATE from now on which this route actually has a
  *     seat I can buy? Scans the bookable window. Needs a session token.
  */
-import { ADVANCE_DAYS, SALE_OPEN_TIME, ZONE_OPENING_TIME, SEAT_CLASS_LABELS } from './config.js';
+import {
+  ADVANCE_DAYS, SALE_OPEN_TIME, SALE_OPEN_TIME_KEY, ZONE_OPENING_TIME, SEAT_CLASS_LABELS,
+} from './config.js';
+import { getMeta } from './db.js';
 import { findTrainsForRoute, stationLabel } from './catalog.js';
 import { searchTrips, bookingUrl, UpstreamError } from './shohoz.js';
 import {
@@ -32,20 +35,51 @@ export function bookingWindow(now = new Date()) {
 }
 
 /**
+ * The release time actually in force: measured if we have ever seen it,
+ * otherwise the documented default. Cached briefly because routePlan() calls
+ * this on every request and the value changes at most once a day.
+ */
+let saleTimeCache = { value: null, at: 0 };
+
+export async function effectiveSaleOpenTime() {
+  if (saleTimeCache.value && Date.now() - saleTimeCache.at < 60_000) return saleTimeCache.value;
+  let value = SALE_OPEN_TIME;
+  let source = 'default';
+  try {
+    const observed = await getMeta(SALE_OPEN_TIME_KEY);
+    if (observed && /^\d{2}:\d{2}:\d{2}$/.test(observed)) { value = observed; source = 'measured'; }
+  } catch { /* database not reachable — the default is still correct enough */ }
+  saleTimeCache = { value, at: Date.now(), source };
+  return value;
+}
+
+export function saleOpenTimeSource() {
+  return saleTimeCache.source || 'default';
+}
+
+/** Test hook: the 60s cache would otherwise hide a freshly measured time. */
+export function __resetSaleTimeCache() {
+  saleTimeCache = { value: null, at: 0 };
+}
+
+/**
  * Sale-open instant for one journey date.
  *
- * The gate is the booking window rolling forward at Dhaka midnight, which is
- * the same moment for every train on every route — the train's zone opening
- * time is carried through as `zoneOpenTime` for display only. See
- * ZONE_OPENING_TIME in config.js for why it must not gate this.
+ * Two different moments are easy to confuse. The booking WINDOW rolls forward
+ * at Dhaka midnight, which is when the date becomes selectable; the SEATS are
+ * released later that morning. This returns the second one, because that is
+ * when a ticket can actually be bought.
+ *
+ * `zoneOpenTime` is the operator's published counter hour, carried for display
+ * only — see ZONE_OPENING_TIME in config.js.
  */
-export function saleOpening(journeyDateISO, train, now = new Date()) {
+export function saleOpening(journeyDateISO, train, now = new Date(), openTime = SALE_OPEN_TIME) {
   const openDate = addDays(journeyDateISO, -ADVANCE_DAYS);
-  const opensAt = dhakaToUTC(openDate, SALE_OPEN_TIME);
+  const opensAt = dhakaToUTC(openDate, openTime);
   const msUntil = opensAt.getTime() - now.getTime();
   return {
     openDate,
-    openTime: SALE_OPEN_TIME.slice(0, 5),
+    openTime: openTime.slice(0, 5),
     zoneOpenTime: (train.openingTime || ZONE_OPENING_TIME[train.zone] || ZONE_OPENING_TIME.EAST).slice(0, 5),
     opensAtISO: opensAt.toISOString(),
     msUntil,
@@ -73,11 +107,14 @@ function runsOn(train, journeyDateISO) {
 export async function routePlan({ fromCity, toCity, dateISO, now = new Date() }) {
   const window = bookingWindow(now);
   const dateStatus = classifyDate(dateISO, now);
-  const allTrains = await findTrainsForRoute(fromCity, toCity);
+  const [allTrains, openTime] = await Promise.all([
+    findTrainsForRoute(fromCity, toCity),
+    effectiveSaleOpenTime(),
+  ]);
 
   const trains = allTrains.map((t) => {
     const schedule = runsOn(t, dateISO);
-    const sale = saleOpening(dateISO, t, now);
+    const sale = saleOpening(dateISO, t, now, openTime);
 
     // Overnight legs land on the following calendar day.
     const overnight = t.departureTime && t.arrivalTime &&
@@ -117,6 +154,7 @@ export async function routePlan({ fromCity, toCity, dateISO, now = new Date() })
       zoneOpenTime: zoneTimes.length === 1 ? zoneTimes[0] : null,
       isOpen: sale.isOpen,
       msUntil: sale.msUntil,
+      openTimeSource: saleOpenTimeSource(),
       trains: running.map((t) => ({ trainNumber: t.trainNumber, trainName: t.trainName })),
     };
   }

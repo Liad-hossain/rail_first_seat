@@ -111,7 +111,40 @@ export const TZ_OFFSET_MINUTES = 6 * 60;
  * (today + 10) and East-zone Dhaka -> Sreemangal tickets for it were on sale.
  */
 export const ADVANCE_DAYS = 10;
-export const SALE_OPEN_TIME = '00:00:00';
+
+/**
+ * The time of day, in Dhaka, at which those seats actually become buyable.
+ *
+ * This is NOT the same moment the date appears in the datepicker. The window
+ * rolls at 00:00 — verified in the site's own JS — but the seats themselves
+ * are released later that morning, so an alarm at midnight fires at an empty
+ * page.
+ *
+ * Evidence pinning 08:00:
+ *   - 28 Aug 2026, ~11:15 BST: Dhaka -> Sreemangal for 7 Sep was already
+ *     selling, so release is at or before 11:15 on D-10.
+ *   - Observed directly: at 00:00 the date is selectable but has no seats.
+ *   - The only clock time Bangladesh Railway publishes inside that range is
+ *     08:00. (14:00, the East-zone figure, is excluded by the first point —
+ *     every Dhaka–Sylhet train is East zone.)
+ *
+ * Treated as a default, not gospel: SALE_OPEN_TIME_KEY below holds a time
+ * MEASURED from live seat data, and it wins whenever it exists. See
+ * probeSaleRelease() in history.js.
+ */
+export const SALE_OPEN_TIME = process.env.BR_SALE_OPEN_TIME || '08:00:00';
+
+/** meta keys holding the measured release time and the evidence behind it. */
+export const SALE_OPEN_TIME_KEY = 'observed_sale_open_time';
+export const SALE_OPEN_EVIDENCE_KEY = 'observed_sale_open_evidence';
+
+/**
+ * How often the probe re-checks the newest journey date while it is waiting
+ * for seats to appear, and the Dhaka hours it bothers looking.
+ */
+export const PROBE_INTERVAL_MS = 60_000;
+export const PROBE_FROM_HOUR = 0;
+export const PROBE_TO_HOUR = 16;
 
 /**
  * The operator's published counter opening time, carried per-train by
