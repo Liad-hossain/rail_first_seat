@@ -20,7 +20,7 @@ import {
   ADVANCE_DAYS, TZ, PROBE_INTERVAL_MS, PROBE_FROM_HOUR, PROBE_TO_HOUR,
   SALE_OPEN_TIME_KEY, SALE_OPEN_EVIDENCE_KEY,
 } from './config.js';
-import { UpstreamError } from './shohoz.js';
+import { UpstreamError, hasToken } from './shohoz.js';
 
 /** Persist one observation of a route+date. Returns the snapshot id. */
 export async function recordSnapshot({ fromCity, toCity, dateISO, live, source = 'live-search', error = null }) {
@@ -277,7 +277,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
  * Safe to call with no token — it records nothing and says so.
  */
 export async function collectOnce({ token, log = () => {} }) {
-  if (!token) return { skipped: true, reason: 'no-token', recorded: 0 };
+  if (!hasToken(token)) return { skipped: true, reason: 'no-token', recorded: 0 };
 
   const watches = await listWatches();
   if (!watches.length) return { skipped: true, reason: 'empty-watchlist', recorded: 0 };
@@ -384,7 +384,7 @@ export function startCollector({ getToken, intervalMs = 60 * 60 * 1000, log = co
  * without a session token.
  */
 export async function probeSaleRelease({ token, log = () => {} }) {
-  if (!token) return { skipped: 'no token' };
+  if (!hasToken(token)) return { skipped: 'no token' };
 
   const { y, m, d, hh } = nowInDhaka();
   const todayDhaka = `${y}-${String(m).padStart(2, '0')}-${String(d).padStart(2, '0')}`;

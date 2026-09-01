@@ -38,6 +38,16 @@ mock.module(path.join(SRC, 'shohoz.js'), {
     checkToken: async () => ({ valid: true }),
     fetchAllTrains: async () => [],
     fetchTrainRoute: async () => ({}),
+    // Credentials are per-user now and may arrive as a bare token string or as
+    // a { token, deviceId, deviceKey } object; mirror the real predicate so the
+    // merge logic is exercised through the same gate production uses.
+    hasToken: (t) => Boolean(t && typeof t === 'object' ? t.token : t),
+    asCredentials: (t) => (t && typeof t === 'object'
+      ? t
+      : { token: t || null, deviceId: null, deviceKey: null }),
+    setDeviceIdentity: () => {},
+    getDeviceIdentity: () => ({ deviceId: null, deviceKey: null }),
+    normalizeCredentials: (v) => ({ token: String(v || ''), deviceId: null, deviceKey: null }),
   },
 });
 

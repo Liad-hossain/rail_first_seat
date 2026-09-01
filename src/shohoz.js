@@ -38,8 +38,12 @@ export class UpstreamError extends Error {
  * session to the device it was issued to, so replaying the bare JWT gets a
  * 401 that is indistinguishable from expiry.
  *
- * There is one Bangladesh Railway session per instance, so this is ambient
- * rather than threaded through every call site.
+ * This is the process-wide DEFAULT identity — the one a deployment configures
+ * through BR_DEVICE_ID/BR_DEVICE_KEY, and the one the background collector and
+ * release probe run under. It is deliberately not the whole story: sessions are
+ * per-user now, so a request carrying its own credentials overrides it. Never
+ * mutate it per request — it is shared by every in-flight call in the process,
+ * and one user's device headers would be sent with another user's token.
  */
 let deviceIdentity = { deviceId: null, deviceKey: null };
 
@@ -50,6 +54,34 @@ export function setDeviceIdentity({ deviceId = null, deviceKey = null } = {}) {
 export function getDeviceIdentity() {
   return { ...deviceIdentity };
 }
+
+/**
+ * Credentials for one upstream call: a session token and the device it was
+ * issued to, which upstream binds together.
+ *
+ * Accepts either a bare token string — the degenerate form used by background
+ * jobs, which run on the ambient device identity — or a
+ * `{ token, deviceId, deviceKey }` object belonging to one signed-in user.
+ * Returning a fresh object per call is what keeps concurrent requests from
+ * different users off each other's headers.
+ */
+export function asCredentials(tokenOrCreds) {
+  if (tokenOrCreds && typeof tokenOrCreds === 'object') {
+    return {
+      token: tokenOrCreds.token || null,
+      deviceId: tokenOrCreds.deviceId || deviceIdentity.deviceId,
+      deviceKey: tokenOrCreds.deviceKey || deviceIdentity.deviceKey,
+    };
+  }
+  return {
+    token: tokenOrCreds || null,
+    deviceId: deviceIdentity.deviceId,
+    deviceKey: deviceIdentity.deviceKey,
+  };
+}
+
+/** True when credentials in either form actually carry a token. */
+export const hasToken = (tokenOrCreds) => Boolean(asCredentials(tokenOrCreds).token);
 
 /**
  * Accept whatever the user actually managed to copy.
@@ -80,7 +112,8 @@ export function normalizeCredentials(input) {
   return { token: clean(raw), deviceId: null, deviceKey: null };
 }
 
-function baseHeaders(token) {
+function baseHeaders(tokenOrCreds) {
+  const creds = asCredentials(tokenOrCreds);
   const h = {
     accept: 'application/json',
     'user-agent': USER_AGENT,
@@ -90,9 +123,11 @@ function baseHeaders(token) {
     // a non-browser request.
     'x-requested-with': 'XMLHttpRequest',
   };
-  if (deviceIdentity.deviceId) h['x-device-id'] = deviceIdentity.deviceId;
-  if (deviceIdentity.deviceKey) h['x-device-key'] = deviceIdentity.deviceKey;
-  if (token) h.authorization = `Bearer ${token}`;
+  // Read from the per-call credentials, never the module default directly, so
+  // a user's token always travels with its own device.
+  if (creds.deviceId) h['x-device-id'] = creds.deviceId;
+  if (creds.deviceKey) h['x-device-key'] = creds.deviceKey;
+  if (creds.token) h.authorization = `Bearer ${creds.token}`;
   return h;
 }
 
@@ -185,7 +220,7 @@ export async function fetchTrainRoute(trainNumber, departureDateISO) {
  * trip offers comes back regardless.
  */
 export async function searchTrips({ fromCity, toCity, dateISO, seatClass = 'S_CHAIR', token }) {
-  if (!token) {
+  if (!hasToken(token)) {
     throw new UpstreamError(
       'Live seat counts need a Bangladesh Railway session token. Add one in Settings.',
       { code: 'AUTH_REQUIRED', needsAuth: true },

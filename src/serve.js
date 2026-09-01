@@ -13,7 +13,8 @@ import {
   historyOverview, listWatches, addWatch, startCollector, startReleaseProbe,
   saleReleaseEvidence,
 } from './history.js';
-import { notifyStatus, startNotifications } from './notify.js';
+import { notifyStatus, startNotifications, ensureBots } from './notify.js';
+import { countBots } from './bots.js';
 import { setDeviceIdentity } from './shohoz.js';
 import {
   handlers, HttpError, sendJson, serveStatic, readBody, dispatch,
@@ -97,8 +98,14 @@ async function start() {
   // only accepted alongside the device it was issued to.
   setDeviceIdentity(await getDeviceIdentity());
 
-  const [catalog, token, overview, notify, release] = await Promise.all([
-    catalogStatus(), getToken(), historyOverview(), notifyStatus(), saleReleaseEvidence(),
+  // Seeds the shared bot from TELEGRAM_BOT_TOKEN, if the deployment sets one,
+  // before anything reports on it. Bots are per user; this is only the one a
+  // visitor with no bot of their own can still pair with.
+  await ensureBots({ log: console.log });
+
+  const [catalog, token, overview, notify, bots, release] = await Promise.all([
+    catalogStatus(), getToken(), historyOverview(), notifyStatus(), countBots(),
+    saleReleaseEvidence(),
   ]);
 
   server.listen(PORT, () => {
@@ -106,15 +113,18 @@ async function start() {
     console.log(`  database: ${conn.version} at ${conn.label}`);
     console.log(`  catalog : ${catalog.trains} trains, ${catalog.stations} stations, ${catalog.stops} stops` +
       (catalog.syncedAt ? ` (synced ${catalog.syncedAt})` : ''));
-    console.log(`  session : ${token ? 'token present — live seat counts enabled' : 'no token — schedules and sale times only'}`);
+    console.log(`  session : ${token.token
+      ? `background token present (${token.source}) — history and the release probe can run`
+      : 'no token — schedules and sale times only, until a signed-in user saves one'}`);
     console.log(`  history : ${overview.snapshots} snapshot(s) recorded`);
     console.log(`  release : seats open ${release.time || SALE_OPEN_TIME} Dhaka`
       + (release.evidence
         ? ` (measured ${release.evidence.observedOn})`
         : ' (default — will self-correct once a session token lets it be measured)'));
-    console.log(`  alarms  : ${notify.configured
-      ? `Telegram @${notify.botUsername} — sale-open alarms enabled`
-      : 'no bot connected yet — add one in Settings to enable alarms'}\n`);
+    console.log(`  alarms  : ${bots
+      ? `${bots} Telegram bot(s) connected`
+        + (notify.sharedBot ? `, shared @${notify.sharedBot.username}` : ', none shared')
+      : 'no bot connected yet — users add their own in Settings'}\n`);
   });
 
   // Seeding needs the catalog, so it waits for a first-run sync to finish.

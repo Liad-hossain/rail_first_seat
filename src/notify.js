@@ -26,6 +26,7 @@ import {
   ALARM_MAX_DURATION_MS,
   ALARM_MAX_RINGS,
   ALARM_TRIGGER_TAG,
+  ALARM_STOP_TAG,
   WEBHOOK_MODE,
   PUBLIC_BASE_URL,
   TELEGRAM_WEBHOOK_SECRET,
@@ -33,7 +34,7 @@ import {
   TEST_ALARM_DELAY_SECONDS,
   TEST_ALARM_MAX_DELAY_SECONDS,
 } from "./config.js";
-import { query, one, transact, isoTimestamp, getMeta, setMeta } from "./db.js";
+import { query, one, transact, isoTimestamp } from "./db.js";
 import { routePlan, effectiveSaleOpenTime } from "./availability.js";
 import { stationLabel } from "./catalog.js";
 import { bookingUrl } from "./shohoz.js";
@@ -58,6 +59,24 @@ import {
   editMessageText,
   esc,
 } from "./telegram.js";
+import {
+  BOT_TOKEN_RE,
+  botIdOf,
+  listBots,
+  botByRowId,
+  botByBotId,
+  defaultBot,
+  botForSubscriber,
+  anyBotConfigured,
+  upsertBot,
+  claimBot,
+  deleteBot,
+  setBotOffset,
+  getBotOffset,
+  setBotWebhook,
+  ensureDefaultBot,
+  describeBot,
+} from "./bots.js";
 
 /** Thrown for user-fixable problems; the server maps it to a 400. */
 export class NotifyError extends Error {
@@ -72,18 +91,16 @@ const newCode = () => crypto.randomBytes(4).toString("hex");
 const newToken = () => crypto.randomBytes(24).toString("base64url");
 
 /* ------------------------------------------------------------------ *
- * The bot token
+ * Bots and delivery
  *
- * Saved from the UI into `meta`, exactly like the Bangladesh Railway session
- * token, so connecting a bot never means editing a file and restarting.
- * TELEGRAM_BOT_TOKEN stays as a fallback for a deployment that would rather
- * inject it as a secret; whatever is in the database wins.
+ * A bot is a row in `bots` belonging to whoever paired on it first — see
+ * bots.js. What lives here is everything about *delivering* through one:
+ * registering its webhook, polling it, and connecting or disconnecting it.
+ *
+ * TELEGRAM_BOT_TOKEN is no longer "the" bot. It seeds a single shared bot that
+ * a visitor with no bot of their own may still pair with, and it is what the
+ * previously single-bot deployment migrates into.
  * ------------------------------------------------------------------ */
-
-/** Which delivery mode the bot was last configured for. */
-export const DELIVERY_MODE_KEY = "telegram_delivery_mode";
-
-export const WEBHOOK_SECRET_FP_KEY = "telegram_webhook_secret_fp";
 
 const secretFingerprint = (secret) =>
   secret
@@ -94,8 +111,41 @@ const secretFingerprint = (secret) =>
         .slice(0, 16)
     : "none";
 
-export function webhookUrl() {
-  return `${PUBLIC_BASE_URL.replace(/\/+$/, "")}/api/telegram/webhook`;
+/**
+ * Each bot gets its own webhook URL, ending in its bot id.
+ *
+ * A Telegram update carries nothing that says which bot received it. With one
+ * site-wide bot that never mattered; with a bot per user it is the only thing
+ * separating a `/start` on your bot from a `/start` on someone else's, so it
+ * has to come from the path. The bot id is the visible half of every bot token
+ * and is not a secret — authenticity still rests entirely on the secret header.
+ *
+ * Called with no argument it yields the old pathless URL, which is what a bot
+ * registered before this change is still pointing at until the next cron pass
+ * moves it.
+ */
+export function webhookUrl(botId = null) {
+  const base = `${PUBLIC_BASE_URL.replace(/\/+$/, "")}/api/telegram/webhook`;
+  return botId ? `${base}/${botId}` : base;
+}
+
+/**
+ * The secret Telegram echoes back for one bot — derived, not stored.
+ *
+ * Per-bot because these are other people's bots: whoever can read one bot's
+ * secret must learn nothing about anyone else's. Deriving rather than storing
+ * means rotating TELEGRAM_WEBHOOK_SECRET rotates every bot at once with no
+ * migration, and the hex digest is well inside Telegram's 1-256 characters of
+ * [A-Za-z0-9_-].
+ */
+export function webhookSecretFor(botId = null) {
+  if (!TELEGRAM_WEBHOOK_SECRET) return "";
+  // The pathless legacy URL predates per-bot secrets and still uses the raw one.
+  if (!botId) return TELEGRAM_WEBHOOK_SECRET;
+  return crypto
+    .createHmac("sha256", TELEGRAM_WEBHOOK_SECRET)
+    .update(String(botId))
+    .digest("hex");
 }
 
 export function webhookBlocker() {
@@ -111,39 +161,42 @@ export function webhookBlocker() {
   return null;
 }
 
-async function registerWebhook({ token = null, log = () => {} } = {}) {
+async function registerWebhook(bot, { log = () => {} } = {}) {
   const blocked = webhookBlocker();
   if (blocked) {
     log(`telegram: NOT registering a webhook — ${blocked}`);
     return { blocked };
   }
-  const url = webhookUrl();
-  await setWebhook(url, { secret: TELEGRAM_WEBHOOK_SECRET, token });
-  await setMeta(
-    WEBHOOK_SECRET_FP_KEY,
-    secretFingerprint(TELEGRAM_WEBHOOK_SECRET),
-  );
-  await setMeta(DELIVERY_MODE_KEY, "webhook");
+  const url = webhookUrl(bot.bot_id);
+  const secret = webhookSecretFor(bot.bot_id);
+  await setWebhook(url, { secret, token: bot.token });
+  await setBotWebhook(bot.id, {
+    url,
+    secretFp: secretFingerprint(secret),
+    mode: "webhook",
+  });
   return { registered: url };
 }
 
-/** True when updates are being pushed to a webhook rather than polled. */
-export async function webhookIsInCharge() {
-  return (await getMeta(DELIVERY_MODE_KEY)) === "webhook";
+/** True when this bot's updates are pushed to a webhook rather than polled. */
+export function webhookIsInCharge(bot) {
+  return bot?.delivery_mode === "webhook";
 }
 
 /**
- * Put the webhook back if it has gone missing.
+ * Put every bot's webhook back if it has gone missing.
  *
  * A webhook can be cleared by anything that polls the same bot — most easily a
  * developer running the server locally against the production database. The
  * symptom is subtle and one-directional: outbound messages still arrive, so
  * alarms look fine, while every button press and /start silently queues up
  * undelivered. Cheap enough to check on the same cron that fires alarms.
+ *
+ * This is also the migration path off the single pathless webhook: a bot that
+ * predates per-bot URLs is found pointing at the old one and moved.
  */
 export async function ensureWebhook({ log = () => {} } = {}) {
   if (!WEBHOOK_MODE) return { skipped: "not in webhook mode" };
-  if (!(await botConfigured())) return { skipped: "no bot token" };
 
   const blocked = webhookBlocker();
   if (blocked) {
@@ -151,17 +204,32 @@ export async function ensureWebhook({ log = () => {} } = {}) {
     return { blocked };
   }
 
-  const want = webhookUrl();
+  const bots = await listBots();
+  if (!bots.length) return { skipped: "no bot connected" };
+
+  const results = [];
+  for (const bot of bots) {
+    try {
+      results.push({ botId: bot.bot_id, ...(await ensureOneWebhook(bot, { log })) });
+    } catch (err) {
+      // One unreachable or revoked bot must not stop the others being repaired.
+      results.push({ botId: bot.bot_id, error: err.message });
+    }
+  }
+  return { bots: results };
+}
+
+async function ensureOneWebhook(bot, { log = () => {} } = {}) {
+  const want = webhookUrl(bot.bot_id);
   let info;
   try {
-    info = await getWebhookInfo();
+    info = await getWebhookInfo({ token: bot.token });
   } catch (err) {
     return { skipped: `could not read webhook info: ${err.message}` };
   }
 
-  const wantFp = secretFingerprint(TELEGRAM_WEBHOOK_SECRET);
-  const haveFp = await getMeta(WEBHOOK_SECRET_FP_KEY);
-  const staleSecret = haveFp !== wantFp;
+  const wantFp = secretFingerprint(webhookSecretFor(bot.bot_id));
+  const staleSecret = bot.webhook_secret_fp !== wantFp;
 
   if (info?.url === want && !staleSecret) {
     return {
@@ -175,10 +243,10 @@ export async function ensureWebhook({ log = () => {} } = {}) {
   const why =
     info?.url !== want
       ? `was ${info?.url ? `pointing at ${info.url}` : "missing"}`
-      : `was registered with a ${haveFp === "none" ? "missing" : "different"} secret`;
-  await registerWebhook({ log });
+      : `was registered with a ${bot.webhook_secret_fp ? "different" : "missing"} secret`;
+  await registerWebhook(bot, { log });
   log(
-    `telegram: webhook ${why} — re-registered at ${want}` +
+    `telegram: webhook for @${bot.username || bot.bot_id} ${why} — re-registered at ${want}` +
       (info?.pending_update_count
         ? ` (${info.pending_update_count} queued update(s) will now be delivered)`
         : ""),
@@ -192,58 +260,79 @@ export async function ensureWebhook({ log = () => {} } = {}) {
   };
 }
 
+/**
+ * The default bot's token: the fallback for a call with no user in scope.
+ *
+ * Almost nothing uses it any more — a message belongs to an account, and an
+ * account belongs to a bot, so the token comes from the row. This exists for
+ * the shared bot and for `botConfigured()`.
+ */
 export async function getBotToken() {
-  return (await getMeta("telegram_bot_token")) || TELEGRAM_BOT_TOKEN || null;
+  try {
+    const bot = await defaultBot();
+    if (bot?.token) return bot.token;
+  } catch { /* database not up yet — fall through to the env var */ }
+  return TELEGRAM_BOT_TOKEN || null;
 }
 
 /**
  * Installed at module load, not in startNotifications(): a serverless function
  * imports this module and calls into it directly without ever starting the
  * background workers, and it still needs the token to come from the database.
- * Reading through a provider (rather than caching) also means a token saved in
- * the UI takes effect immediately.
  */
 setBotTokenProvider(getBotToken);
 
-/** Never returns the token — only a masked preview and where it came from. */
-export async function botTokenInfo() {
-  const stored = await getMeta("telegram_bot_token");
-  const token = stored || TELEGRAM_BOT_TOKEN || null;
-  if (!token) return { present: false, fromEnv: false };
-  return {
-    present: true,
-    fromEnv: !stored && Boolean(TELEGRAM_BOT_TOKEN),
-    savedAt: (await getMeta("telegram_bot_token_saved_at")) || null,
-    // A bot token is "<bot id>:<secret>". The id half is not sensitive and is
-    // the useful part for recognising which bot this is.
-    preview: `${token.split(":")[0]}:${"•".repeat(6)}${token.slice(-4)}`,
-  };
+/** Seed the deployment's own shared bot. Idempotent; safe to call at any boot. */
+export async function ensureBots({ log = () => {} } = {}) {
+  return ensureDefaultBot({ log });
+}
+
+/** Is there any bot at all to ring through? */
+async function canRingAnything() {
+  if (await botConfigured()) return true;
+  return anyBotConfigured();
 }
 
 /**
- * Verify a pasted token against getMe before storing it, so a typo is caught
- * at the moment of pasting rather than silently at 3am when an alarm fires.
+ * Connect a bot, verified against getMe before anything is stored.
+ *
+ * Deliberately does NOT assign ownership: the first chat to pair on the bot
+ * claims it (see handleStart). Pasting a token is not proof of anything beyond
+ * holding it, and the account that will actually receive the alarms is the one
+ * that should own the bot.
  */
-export async function setBotToken(token) {
+export async function connectBot(token, { user = null, log = () => {} } = {}) {
   const trimmed = String(token || "").trim();
 
-  if (!trimmed) {
-    await setMeta("telegram_bot_token", "");
-    await setMeta("telegram_bot_token_saved_at", "");
-    await setMeta("telegram_update_offset", "0");
-    return { cleared: true };
-  }
-
-  if (!/^\d+:[A-Za-z0-9_-]{20,}$/.test(trimmed)) {
+  if (!BOT_TOKEN_RE.test(trimmed)) {
     throw new NotifyError(
       "That does not look like a bot token. @BotFather gives you something like 123456789:AAH... — copy the whole line.",
       "MALFORMED",
     );
   }
 
-  let me;
+  const existing = await botByBotId(botIdOf(trimmed));
+  if (existing?.is_default) {
+    throw new NotifyError(
+      "That is this site's shared bot, which the deployment configures. Press Connect Telegram to use it, or make your own with @BotFather.",
+      "DEFAULT_BOT",
+    );
+  }
+  // Re-pasting a reissued token for your own bot is fine; pasting somebody
+  // else's is not, because it would re-point their webhook.
+  if (
+    existing?.owner_id &&
+    String(existing.owner_id) !== String(user?.id ?? "")
+  ) {
+    throw new NotifyError(
+      "That bot is already connected to another account on this site. Sign in as that account, or create a fresh bot with @BotFather.",
+      "OWNED",
+    );
+  }
+
+  let saved;
   try {
-    me = await getBot({ token: trimmed, refresh: true });
+    saved = await upsertBot(trimmed);
   } catch (err) {
     throw new NotifyError(
       err.code === "BAD_BOT_TOKEN"
@@ -252,6 +341,7 @@ export async function setBotToken(token) {
       "VERIFY_FAILED",
     );
   }
+  const bot = saved.bot;
 
   // Two mutually exclusive delivery modes. On a serverless host there is no
   // process to hold a long poll, so updates must be pushed to a function;
@@ -259,41 +349,92 @@ export async function setBotToken(token) {
   // only symptom would be "pressing Start does nothing".
   let webhook = { had: false };
   if (WEBHOOK_MODE) {
-    // Records the secret alongside the URL, and refuses outright rather than
-    // registering a webhook whose every update will be refused with 503.
-    webhook = await registerWebhook({ token: trimmed, log: console.log });
+    webhook = await registerWebhook(bot, { log });
   } else {
-    webhook = await clearWebhookIfSet({ token: trimmed });
-    await setMeta(DELIVERY_MODE_KEY, "polling");
+    webhook = await clearWebhookIfSet({ token: bot.token, log });
+    await setBotWebhook(bot.id, { url: null, secretFp: null, mode: "polling" });
   }
 
-  const previous = await getMeta("telegram_bot_token");
-  await setMeta("telegram_bot_token", trimmed);
-  await setMeta("telegram_bot_token_saved_at", new Date().toISOString());
-
-  // Update ids are numbered per bot, so a cursor from the old bot would make
-  // the new one skip real updates. Existing chats belong to the old bot too.
-  const swapped = Boolean(previous && previous !== trimmed);
-  if (swapped) await setMeta("telegram_update_offset", "0");
-
-  const { n: strandedChats } = swapped
-    ? await one("SELECT COUNT(*)::int AS n FROM notify_subscribers")
-    : { n: 0 };
-
   return {
-    botUsername: me.username,
-    botName: me.name,
-    swapped,
-    strandedChats,
+    botId: bot.bot_id,
+    botUsername: saved.me.username,
+    botName: saved.me.name,
+    // Already claimed means this is a re-save of your own bot rather than a
+    // new one waiting for its first chat to pair.
+    alreadyOwned: Boolean(bot.owner_id),
     webhookRemoved: webhook.had === true,
     webhookRegistered: webhook.registered || null,
     webhookBlocked: webhook.blocked || null,
   };
 }
 
-export { ALARM_TRIGGER_TAG };
+/**
+ * Disconnect the caller's own bot.
+ *
+ * Genuinely destructive: an account IS a chat on a bot, so removing the bot
+ * removes every account paired through it and their alarms. There is no
+ * sensible alternative — an alarm with no bot to ring through can never fire —
+ * so the count goes back to the caller to be shown before and after.
+ */
+export async function disconnectBot(user, { log = () => {} } = {}) {
+  const bot = await botForSubscriber(user.id);
+  if (!bot) {
+    throw new NotifyError("You have no bot connected.", "NOT_CONFIGURED");
+  }
+  if (bot.is_default) {
+    throw new NotifyError(
+      "This site's shared bot is configured by the deployment and cannot be disconnected from here.",
+      "DEFAULT_BOT",
+    );
+  }
+  if (String(bot.owner_id) !== String(user.id)) {
+    throw new NotifyError(
+      "Only the account that first connected this bot can disconnect it.",
+      "NOT_OWNER",
+    );
+  }
 
-export async function notifyStatus() {
+  try {
+    await clearWebhookIfSet({ token: bot.token, log });
+  } catch (err) {
+    // Telegram being unreachable must not leave the row undeletable.
+    log(`telegram: could not clear the webhook on @${bot.username} — ${err.message}`);
+  }
+  const { removedSubscribers } = await deleteBot(bot.id);
+  log(`telegram: disconnected bot @${bot.username || bot.bot_id}`);
+  return { cleared: true, removedSubscribers };
+}
+
+export { ALARM_TRIGGER_TAG, ALARM_STOP_TAG };
+
+/**
+ * Tell a phone automation to stop ringing.
+ *
+ * Sent as a NEW message rather than folded into the acknowledgement edit,
+ * because Telegram raises no notification for an EDITED message — an
+ * automation can only ever see a new one. Silent, so ending an alarm is not
+ * itself a noise. Failure is non-fatal: the alarm is already acknowledged
+ * server-side, and this only drives the handset.
+ */
+async function sendStopSignal(chatId, headline, { token = null, log = () => {} } = {}) {
+  try {
+    await sendMessage(chatId, `${headline}\n${ALARM_STOP_TAG}`, { silent: true, token });
+  } catch (err) {
+    log(`telegram: stop signal not delivered — ${err.message}`);
+  }
+}
+
+/**
+ * What one viewer may know about the bots on this site.
+ *
+ * The old version answered site-wide and answered it to anybody: an anonymous
+ * visitor got the installed bot's @username, its masked token, its webhook URL
+ * and the deployment's public base URL. None of that is a stranger's business
+ * now that the bot belongs to a person. A signed-in account sees its own bot in
+ * full; everyone else sees only whether a shared bot exists to pair with, which
+ * the sign-in panel genuinely needs in order to offer the choice.
+ */
+export async function notifyStatus({ user = null } = {}) {
   const base = {
     testDelaySeconds: TEST_ALARM_DELAY_SECONDS,
     testRingSeconds: Math.round(ALARM_TEST_DURATION_MS / 1000),
@@ -301,40 +442,49 @@ export async function notifyStatus() {
     ringIntervalSeconds: ALARM_RING_INTERVAL_MS / 1000,
     ringMinutes: Math.round(ALARM_MAX_DURATION_MS / 60_000),
     triggerTag: ALARM_TRIGGER_TAG,
+    stopTag: ALARM_STOP_TAG,
     delivery: WEBHOOK_MODE ? "webhook" : "polling",
-    publicBaseUrl: PUBLIC_BASE_URL || null,
     inboundBlocked: webhookBlocker(),
-    token: await botTokenInfo(),
   };
-  if (!(await botConfigured()))
-    return { ...base, configured: false, botUsername: null };
-  try {
-    const me = await getBot();
+
+  const shared = await defaultBot();
+  const sharedBot = shared
+    ? { botId: shared.bot_id, username: shared.username || null }
+    : null;
+
+  if (!user) {
     return {
       ...base,
-      configured: true,
-      botUsername: me.username,
-      botName: me.name,
-      webhook: await webhookHealth(),
-    };
-  } catch (err) {
-    return {
-      ...base,
-      configured: false,
-      botUsername: null,
-      error: err.message,
+      // "Is there a bot I could pair with right now" — the only bot fact an
+      // anonymous visitor needs, and the only one they get.
+      configured: Boolean(shared),
+      botUsername: shared?.username || null,
+      sharedBot,
+      bot: { present: Boolean(shared) },
     };
   }
+
+  const bot = await botForSubscriber(user.id);
+  return {
+    ...base,
+    configured: Boolean(bot || shared),
+    botUsername: bot?.username || null,
+    botName: bot?.name || null,
+    sharedBot,
+    bot: describeBot(bot, { viewerId: user.id }),
+    publicBaseUrl: PUBLIC_BASE_URL || null,
+    webhook: bot ? await webhookHealth(bot) : null,
+  };
 }
 
-async function webhookHealth() {
+async function webhookHealth(bot) {
   if (!WEBHOOK_MODE) return { mode: "polling" };
   try {
-    const info = await getWebhookInfo();
+    const info = await getWebhookInfo({ token: bot.token });
     return {
       mode: "webhook",
       url: info?.url || null,
-      expectedUrl: webhookUrl(),
+      expectedUrl: webhookUrl(bot.bot_id),
       pending: info?.pending_update_count ?? 0,
       lastError: info?.last_error_message || null,
       lastErrorAt: info?.last_error_date
@@ -350,27 +500,41 @@ async function webhookHealth() {
  * Subscribers and pairing
  * ------------------------------------------------------------------ */
 
-/** Start pairing: mint a code and the deep link that carries it to the bot. */
-export async function createPairing() {
-  if (!(await botConfigured())) {
+/**
+ * Start pairing: mint a code and the deep link that carries it to the bot.
+ *
+ * The code is minted for one specific bot and is only redeemable there, so a
+ * code shown for your bot cannot be claimed by sending it to somebody else's.
+ * Which bot: the one named by the caller (having just pasted its token), else
+ * the caller's own if they are already signed in, else the shared bot.
+ */
+export async function createPairing({ botId = null, user = null } = {}) {
+  const bot = botId
+    ? await botByBotId(botId)
+    : (user ? await botForSubscriber(user.id) : null) || (await defaultBot());
+
+  if (!bot) {
     throw new NotifyError(
-      "No Telegram bot is connected yet. Add the bot token in Settings first.",
+      "No Telegram bot to connect to. Create one with @BotFather and paste its token first.",
       "NOT_CONFIGURED",
     );
   }
-  const me = await getBot();
+  // A row can exist without a username only if getMe failed when it was saved.
+  const username = bot.username || (await getBot({ token: bot.token })).username;
+
   const code = newCode();
   const now = new Date();
   const expiresAt = new Date(now.getTime() + PAIR_CODE_TTL_MS);
 
   await query(
-    "INSERT INTO notify_pairings (code, created_at, expires_at) VALUES ($1,$2,$3)",
-    [code, now.toISOString(), expiresAt.toISOString()],
+    "INSERT INTO notify_pairings (code, created_at, expires_at, bot_id) VALUES ($1,$2,$3,$4)",
+    [code, now.toISOString(), expiresAt.toISOString(), bot.id],
   );
   return {
     code,
-    deepLink: `https://t.me/${me.username}?start=${code}`,
-    botUsername: me.username,
+    deepLink: `https://t.me/${username}?start=${code}`,
+    botUsername: username,
+    botId: bot.bot_id,
     expiresAt: expiresAt.toISOString(),
   };
 }
@@ -415,11 +579,19 @@ export async function subscriberByToken(token) {
   return { id: row.id, chatId: row.chat_id, displayName: row.display_name };
 }
 
-async function upsertSubscriber(chatId, displayName) {
+/**
+ * The account for one chat *on one bot*.
+ *
+ * Scoped to the bot, not just the chat id: the same person may hold an account
+ * on two different bots, and Telegram gives them the same chat id on both. A
+ * chat-only lookup would have handed the second bot the first bot's account —
+ * and with it that account's alarms and railway session.
+ */
+async function upsertSubscriber(botRowId, chatId, displayName) {
   return transact(async (tx) => {
     const existing = await tx.one(
-      "SELECT id, chat_id, display_name, access_token FROM notify_subscribers WHERE chat_id = $1",
-      [String(chatId)],
+      "SELECT id, chat_id, display_name, access_token FROM notify_subscribers WHERE bot_id = $1 AND chat_id = $2",
+      [botRowId, String(chatId)],
     );
     if (existing) {
       await tx.query(
@@ -433,9 +605,10 @@ async function upsertSubscriber(chatId, displayName) {
       return existing;
     }
     return tx.one(
-      `INSERT INTO notify_subscribers (chat_id, display_name, access_token, created_at, last_seen_at)
-       VALUES ($1,$2,$3,$4,$4) RETURNING id, chat_id, display_name, access_token`,
+      `INSERT INTO notify_subscribers (bot_id, chat_id, display_name, access_token, created_at, last_seen_at)
+       VALUES ($1,$2,$3,$4,$5,$5) RETURNING id, chat_id, display_name, access_token`,
       [
+        botRowId,
         String(chatId),
         displayName || null,
         newToken(),
@@ -584,9 +757,9 @@ export async function sendTestAlarm({
   dateISO,
   delaySeconds,
 }) {
-  if (!(await botConfigured())) {
+  if (!(await botForSubscriber(subscriber.id))) {
     throw new NotifyError(
-      "No Telegram bot is connected yet.",
+      "Your account is not attached to a Telegram bot, so there is nothing to ring. Reconnect Telegram.",
       "NOT_CONFIGURED",
     );
   }
@@ -741,19 +914,28 @@ const HELP = [
   "/stop — cancel all of them",
 ].join("\n");
 
-async function handleStart(msg, payload, log) {
+/**
+ * Every handler takes the bot the update arrived on.
+ *
+ * With one site-wide bot the chat id alone identified an account. It no longer
+ * does: the same chat id exists on every bot its owner has ever opened, so each
+ * lookup is scoped by bot, and each reply is sent back through the same bot it
+ * came from rather than through whichever token happened to be configured.
+ */
+async function handleStart(msg, payload, log, bot) {
   const chatId = msg.chat.id;
+  const send = (text, opts = {}) =>
+    sendMessage(chatId, text, { ...opts, token: bot.token });
   const name =
     [msg.from?.first_name, msg.from?.last_name].filter(Boolean).join(" ") ||
     msg.from?.username ||
     null;
-  const subscriber = await upsertSubscriber(chatId, name);
+  const subscriber = await upsertSubscriber(bot.id, chatId, name);
 
   if (!payload) {
     // Reached by pressing START with no deep-link payload — common when the
     // chat already existed. Ask for the code rather than leaving them stuck.
-    await sendMessage(
-      chatId,
+    await send(
       [
         "👋 <b>Bangladesh Railway sale alarms.</b>",
         "",
@@ -767,12 +949,11 @@ async function handleStart(msg, payload, log) {
   }
 
   const pairing = await one(
-    "SELECT code, expires_at, claimed_at FROM notify_pairings WHERE code = $1",
+    "SELECT code, expires_at, claimed_at, bot_id FROM notify_pairings WHERE code = $1",
     [payload],
   );
   if (!pairing) {
-    await sendMessage(
-      chatId,
+    await send(
       [
         "⚠️ <b>That code is not recognised.</b>",
         "",
@@ -782,16 +963,27 @@ async function handleStart(msg, payload, log) {
     );
     return;
   }
+  // A code is minted for one bot. Redeeming it elsewhere would silently create
+  // an account the website is not watching for, so say so instead.
+  if (pairing.bot_id && String(pairing.bot_id) !== String(bot.id)) {
+    await send(
+      [
+        "⚠️ <b>That code was made for a different bot.</b>",
+        "",
+        "Open the website again and use the link it shows — it points at the bot",
+        "the code belongs to.",
+      ].join("\n"),
+    );
+    return;
+  }
   if (pairing.claimed_at) {
-    await sendMessage(
-      chatId,
+    await send(
       "✅ Already connected. Head back to the website — you can set alarms now.",
     );
     return;
   }
   if (new Date(pairing.expires_at).getTime() < Date.now()) {
-    await sendMessage(
-      chatId,
+    await send(
       "⌛ That connection link has expired. Press <b>Connect Telegram</b> on the website for a fresh one.",
     );
     return;
@@ -801,34 +993,46 @@ async function handleStart(msg, payload, log) {
     "UPDATE notify_pairings SET subscriber_id = $2, claimed_at = $3 WHERE code = $1",
     [payload, subscriber.id, new Date().toISOString()],
   );
-  log(`telegram: paired chat ${chatId}${name ? ` (${name})` : ""}`);
-  await sendMessage(
-    chatId,
+
+  // The first chat to pair on a bot owns it, and is from then on the only
+  // account that may replace or disconnect it. A shared bot stays unowned.
+  const claimed = bot.is_default ? null : await claimBot(bot.id, subscriber.id);
+
+  log(
+    `telegram: paired chat ${chatId}${name ? ` (${name})` : ""} on @${bot.username || bot.bot_id}` +
+      (claimed ? " — and claimed the bot" : ""),
+  );
+  await send(
     [
       `✅ <b>Connected${name ? `, ${esc(name)}` : ""}.</b>`,
       "",
       `Go back to the website and set up to ${MAX_ALERTS_PER_SUBSCRIBER} alarms.`,
       "When a sale opens, this chat will ring.",
+      ...(claimed
+        ? ["", "This bot is now yours — only this account can change or disconnect it."]
+        : []),
     ].join("\n"),
   );
 }
 
-async function handleListCommand(chatId) {
-  const sub = await one(
-    "SELECT id FROM notify_subscribers WHERE chat_id = $1",
-    [String(chatId)],
+/** The account for a chat on this bot, or null. */
+async function subscriberFor(bot, chatId) {
+  return one(
+    "SELECT id FROM notify_subscribers WHERE bot_id = $1 AND chat_id = $2",
+    [bot.id, String(chatId)],
   );
-  if (!sub)
-    return sendMessage(
-      chatId,
-      "You have no alarms set. Set them on the website.",
-    );
+}
+
+async function handleListCommand(bot, chatId) {
+  const send = (text) => sendMessage(chatId, text, { token: bot.token });
+  const sub = await subscriberFor(bot, chatId);
+  if (!sub) return send("You have no alarms set. Set them on the website.");
 
   const { alerts, remaining } = await listAlerts(sub.id, {
     includeDone: false,
   });
   if (!alerts.length)
-    return sendMessage(chatId, "No pending alarms. Set them on the website.");
+    return send("No pending alarms. Set them on the website.");
 
   const lines = alerts.map((a) => {
     const mins = Math.round(
@@ -842,8 +1046,7 @@ async function handleListCommand(chatId) {
           : `in ${Math.max(0, mins)}m`;
     return `• <b>${esc(a.fromLabel)} → ${esc(a.toLabel)}</b> on ${esc(a.journeyDatePretty)}\n  opens ${when}`;
   });
-  return sendMessage(
-    chatId,
+  return send(
     [
       `<b>${alerts.length} pending alarm${alerts.length === 1 ? "" : "s"}</b> (${remaining} slot${remaining === 1 ? "" : "s"} free)`,
       "",
@@ -852,12 +1055,11 @@ async function handleListCommand(chatId) {
   );
 }
 
-async function handleStopCommand(chatId) {
-  const sub = await one(
-    "SELECT id FROM notify_subscribers WHERE chat_id = $1",
-    [String(chatId)],
-  );
-  if (!sub) return sendMessage(chatId, "Nothing to cancel.");
+async function handleStopCommand(bot, chatId) {
+  const sub = await subscriberFor(bot, chatId);
+  if (!sub)
+    return sendMessage(chatId, "Nothing to cancel.", { token: bot.token });
+
   const rows = await query(
     "UPDATE alerts SET status = 'cancelled' WHERE subscriber_id = $1 AND status = 'active' RETURNING id",
     [sub.id],
@@ -867,18 +1069,24 @@ async function handleStopCommand(chatId) {
     "UPDATE alerts SET acknowledged_at = now() WHERE subscriber_id = $1 AND status = 'fired' AND acknowledged_at IS NULL",
     [sub.id],
   );
+  // Carries the stop tag too: /stop is the other way a ringing phone is told
+  // to shut up, and it must work identically.
   return sendMessage(
     chatId,
-    rows.length
-      ? `🛑 Cancelled ${rows.length} alarm${rows.length === 1 ? "" : "s"}.`
-      : "🛑 No pending alarms — anything still ringing is now silenced.",
+    [
+      rows.length
+        ? `🛑 Cancelled ${rows.length} alarm${rows.length === 1 ? "" : "s"}.`
+        : "🛑 No pending alarms — anything still ringing is now silenced.",
+      ALARM_STOP_TAG,
+    ].join("\n"),
+    { silent: true, token: bot.token },
   );
 }
 
 /** Pairing codes are 8 hex characters — see newCode(). */
 const CODE_RE = /^[0-9a-f]{8}$/i;
 
-function makeMessageHandler(log) {
+function makeMessageHandler(log, bot) {
   return async (msg) => {
     if (!msg.chat?.id || typeof msg.text !== "string") return;
     const chatId = msg.chat.id;
@@ -886,38 +1094,43 @@ function makeMessageHandler(log) {
     const [cmd, ...rest] = text.split(/\s+/);
     const command = cmd.toLowerCase().split("@")[0];
 
-    if (command === "/start") return handleStart(msg, rest[0] || null, log);
+    if (command === "/start") return handleStart(msg, rest[0] || null, log, bot);
     if (command === "/alerts" || command === "/list")
-      return handleListCommand(chatId);
+      return handleListCommand(bot, chatId);
     if (command === "/stop" || command === "/cancel")
-      return handleStopCommand(chatId);
+      return handleStopCommand(bot, chatId);
 
     // Telegram only offers the START button on a chat you have never opened.
     // Once you have, the t.me deep link just opens the conversation and the
     // payload is never delivered — so accept the bare code as well.
-    if (CODE_RE.test(text)) return handleStart(msg, text.toLowerCase(), log);
+    if (CODE_RE.test(text)) return handleStart(msg, text.toLowerCase(), log, bot);
 
-    return sendMessage(chatId, HELP);
+    return sendMessage(chatId, HELP, { token: bot.token });
   };
 }
 
-function makeCallbackHandler(log) {
+function makeCallbackHandler(log, bot) {
   return async (cq) => {
     const data = String(cq.data || "");
-    if (!data.startsWith("ack:")) return answerCallback(cq.id);
+    if (!data.startsWith("ack:"))
+      return answerCallback(cq.id, "", { token: bot.token });
 
     const id = Number(data.slice(4));
     const chatId = cq.message?.chat?.id;
-    // Scoped by chat so an ack can only silence the recipient's own alarm.
+    // Scoped by bot AND chat: an ack can only silence an alarm belonging to the
+    // account that this chat is on this bot.
     const row = await one(
       `UPDATE alerts a SET acknowledged_at = now()
          FROM notify_subscribers s
-        WHERE a.id = $1 AND a.subscriber_id = s.id AND s.chat_id = $2
+        WHERE a.id = $1 AND a.subscriber_id = s.id
+          AND s.bot_id = $2 AND s.chat_id = $3
           AND a.acknowledged_at IS NULL
         RETURNING a.id, a.from_city, a.to_city, a.journey_date, a.is_test`,
-      [id, String(chatId)],
+      [id, bot.id, String(chatId)],
     );
-    await answerCallback(cq.id, row ? "Alarm silenced 🔕" : "Already silenced");
+    await answerCallback(cq.id, row ? "Alarm silenced 🔕" : "Already silenced", {
+      token: bot.token,
+    });
     if (!row) return;
 
     log(`telegram: alarm ${id} acknowledged`);
@@ -938,11 +1151,13 @@ function makeCallbackHandler(log) {
           : "Tickets are on sale now. Book before they go.",
       ].join("\n"),
       {
+        token: bot.token,
         buttons: row.is_test
           ? null
           : [[{ text: "🎫 Book now", url: alert.bookingUrl }]],
       },
     );
+    await sendStopSignal(chatId, "🔕 Alarm stopped.", { token: bot.token, log });
   };
 }
 
@@ -961,11 +1176,17 @@ function makeCallbackHandler(log) {
 async function ring(alertRow, { ring: ringNo, late }, log) {
   const alert = rowToAlert(alertRow);
   const test = alert.isTest;
+  // The bot to ring through comes from the row, never from ambient config:
+  // sending one account's alarm as another account's bot would deliver it to
+  // nobody at best, and to the wrong chat at worst.
   const chat = await one(
-    "SELECT chat_id FROM notify_subscribers WHERE id = $1",
+    `SELECT s.chat_id, b.token AS bot_token
+       FROM notify_subscribers s LEFT JOIN bots b ON b.id = s.bot_id
+      WHERE s.id = $1`,
     [alertRow.subscriber_id],
   );
   if (!chat) throw new Error(`alert ${alert.id} has no subscriber`);
+  const botToken = chat.bot_token || null;
 
   const text = await alarmText(alert, { ring: ringNo, late, test });
   const previousMessageId = alertRow.last_message_id;
@@ -975,13 +1196,14 @@ async function ring(alertRow, { ring: ringNo, late }, log) {
     try {
       const msg = await sendMessage(chat.chat_id, text, {
         buttons: alarmButtons(alert),
+        token: botToken,
       });
       await query(
         "UPDATE alerts SET rings_sent = $2, last_message_id = $3, last_error = NULL WHERE id = $1",
         [alert.id, ringNo, msg?.message_id ?? null],
       );
       if (previousMessageId)
-        await deleteMessage(chat.chat_id, previousMessageId);
+        await deleteMessage(chat.chat_id, previousMessageId, { token: botToken });
       if (ringNo === 1 || ringNo % 6 === 0) {
         log(
           `alarm: ${test ? "TEST " : ""}ringing ${alert.fromLabel} → ${alert.toLabel} ${alert.journeyDate} (ring ${ringNo}${late ? ", late" : ""})`,
@@ -1136,9 +1358,9 @@ export function startAlertScheduler({ log = console.log } = {}) {
       "DELETE FROM alerts WHERE is_test = TRUE AND created_at < now() - INTERVAL '1 day'",
     );
 
-    // With no bot connected there is nothing to ring. Alarms stay pending
-    // rather than failing, so connecting a bot later still honours them.
-    if (!(await botConfigured())) return;
+    // With no bot connected anywhere there is nothing to ring. Alarms stay
+    // pending rather than failing, so connecting a bot later still honours them.
+    if (!(await canRingAnything())) return;
 
     const cutoff = new Date(Date.now() + SCHEDULER_LOOKAHEAD_MS).toISOString();
     const due = await query(
@@ -1255,7 +1477,7 @@ export async function runAlarmTick({
     "DELETE FROM alerts WHERE is_test = TRUE AND created_at < now() - INTERVAL '1 day'",
   );
 
-  if (!(await botConfigured())) return out;
+  if (!(await canRingAnything())) return out;
 
   // Anything already due, plus anything due inside the window we can wait for.
   const cutoff = new Date(Date.now() + waitWindowMs).toISOString();
@@ -1300,29 +1522,113 @@ export async function runAlarmTick({
  *
  * Long-polling and webhooks deliver the identical payload, so both paths land
  * here and no behaviour can drift between deployment styles.
+ *
+ * `botId` is the numeric bot id the update arrived for — from the webhook path,
+ * or from the poll loop that owns that bot. Omitting it means the shared bot,
+ * which is what the pathless legacy webhook resolves to until the cron moves it
+ * to its own URL.
  */
-export async function handleTelegramUpdate(update, { log = console.log } = {}) {
-  if (update?.message) return makeMessageHandler(log)(update.message);
+export async function handleTelegramUpdate(
+  update,
+  { log = console.log, botId = null } = {},
+) {
+  const bot = botId ? await botByBotId(botId) : await defaultBot();
+  if (!bot) {
+    log(
+      `telegram: update for ${botId ? `unknown bot ${botId}` : "no configured bot"} — ignored`,
+    );
+    return null;
+  }
+  if (update?.message) return makeMessageHandler(log, bot)(update.message);
   if (update?.callback_query)
-    return makeCallbackHandler(log)(update.callback_query);
+    return makeCallbackHandler(log, bot)(update.callback_query);
   return null;
 }
 
+/**
+ * Long-poll every connected bot, and keep that set current.
+ *
+ * getUpdates is per-token and its update ids are numbered per bot, so N bots
+ * means N loops and N cursors — there is no way to multiplex them. The set is
+ * reconciled on a timer rather than fixed at boot because connecting a bot in
+ * the UI has to start listening to it without a restart, which the old
+ * single-bot loop got for free from its token provider.
+ *
+ * Only ever runs where there is a process to hold a connection open: a
+ * serverless deployment uses webhooks instead.
+ */
+function startTelegramListeners({ log = console.log } = {}) {
+  const running = new Map(); // bot_id -> { listener, token }
+  let stopped = false;
+
+  async function reconcile() {
+    const bots = await listBots();
+    const live = new Set();
+
+    for (const bot of bots) {
+      live.add(bot.bot_id);
+      const current = running.get(bot.bot_id);
+      if (current?.token === bot.token) continue;
+      // A reissued token is the same bot on a new connection: restart the loop
+      // on it rather than leaving one polling with a token Telegram now 401s.
+      current?.listener.stop();
+
+      const listener = startTelegramListener({
+        token: bot.token,
+        getOffset: () => getBotOffset(bot.id),
+        setOffset: (v) => setBotOffset(bot.id, v),
+        // Never hijack a deployment's webhook by polling the same bot.
+        isWebhookMode: async () => {
+          if (WEBHOOK_MODE) return false;
+          return webhookIsInCharge(await botByRowId(bot.id));
+        },
+        onMessage: makeMessageHandler(log, bot),
+        onCallback: makeCallbackHandler(log, bot),
+        log,
+      });
+      running.set(bot.bot_id, { listener, token: bot.token });
+    }
+
+    for (const [botId, entry] of running) {
+      if (live.has(botId)) continue;
+      entry.listener.stop();
+      running.delete(botId);
+      log(`telegram: stopped polling bot ${botId} — it was disconnected`);
+    }
+  }
+
+  (async () => {
+    while (!stopped) {
+      try {
+        await reconcile();
+      } catch (err) {
+        log(`telegram: could not refresh the bot list — ${err.message}`);
+      }
+      await new Promise((r) => setTimeout(r, BOT_RECONCILE_MS));
+    }
+  })();
+
+  return {
+    stop() {
+      stopped = true;
+      for (const entry of running.values()) entry.listener.stop();
+      running.clear();
+    },
+  };
+}
+
+/** How often the poll loops are matched against the bots in the database. */
+const BOT_RECONCILE_MS = 5_000;
+
 export function startNotifications({ log = console.log } = {}) {
-  const listener = startTelegramListener({
-    getOffset: () => getMeta("telegram_update_offset", "0"),
-    setOffset: (v) => setMeta("telegram_update_offset", v),
-    // Never hijack a deployment's webhook by polling the same bot.
-    isWebhookMode: () =>
-      WEBHOOK_MODE ? Promise.resolve(false) : webhookIsInCharge(),
-    onMessage: makeMessageHandler(log),
-    onCallback: makeCallbackHandler(log),
-    log,
-  });
+  ensureBots({ log }).catch((err) =>
+    log(`telegram: could not seed the shared bot — ${err.message}`),
+  );
+  const listeners = startTelegramListeners({ log });
   const scheduler = startAlertScheduler({ log });
   return {
     stop() {
-      listener.stop();
+      listeners.stop();
       scheduler.stop();
     },
   };

@@ -37,42 +37,27 @@ import {
   normalizeCredentials, setDeviceIdentity,
 } from './shohoz.js';
 import {
-  notifyStatus, setBotToken, createPairing, pairingStatus, subscriberByToken,
+  notifyStatus, connectBot, disconnectBot, createPairing, pairingStatus,
   listAlerts, createAlert, cancelAlert, sendTestAlarm, startNotifications, NotifyError,
 } from './notify.js';
 import { normalizeDate, todayISO, addDays } from './time.js';
+import {
+  currentUser, userCredentials, setUserCredentials, userTokenInfo, serviceCredentials,
+} from './session.js';
 
 /* ---------------------------- token storage ---------------------------- */
 
-/**
- * The Bangladesh Railway session token lives in the database (or BR_TOKEN). It
- * is the user's own e-ticket session, used only to read their own search
- * results from railway.gov.bd.
- */
+
 async function getToken() {
-  return (await getMeta('br_token')) || process.env.BR_TOKEN || null;
+  return serviceCredentials();
 }
 
-async function setToken(token) {
-  await setMeta('br_token', token || '');
-  await setMeta('br_token_saved_at', token ? new Date().toISOString() : '');
-}
 
-/**
- * The device the session token was issued to. Stored beside the token because
- * upstream binds one to the other — see setDeviceIdentity in shohoz.js.
- */
 async function getDeviceIdentity() {
   return {
     deviceId: (await getMeta('br_device_id')) || process.env.BR_DEVICE_ID || null,
     deviceKey: (await getMeta('br_device_key')) || process.env.BR_DEVICE_KEY || null,
   };
-}
-
-async function setDeviceCredentials({ deviceId, deviceKey }) {
-  if (deviceId !== undefined) await setMeta('br_device_id', deviceId || '');
-  if (deviceKey !== undefined) await setMeta('br_device_key', deviceKey || '');
-  setDeviceIdentity(await getDeviceIdentity());
 }
 
 /** Decode a JWT's expiry without verifying it — we only need the claim. */
@@ -105,34 +90,6 @@ function explainRejection(token, probeReason, hadDeviceId) {
   return probeReason || 'Bangladesh Railway rejected that token.';
 }
 
-/** Never returns the token itself — only a masked preview and its metadata. */
-async function tokenInfo() {
-  const stored = await getMeta('br_token');
-  const token = stored || process.env.BR_TOKEN || null;
-  if (!token) return { present: false };
-
-  let expiresAt = null;
-  let subject = null;
-  try {
-    const payload = JSON.parse(Buffer.from(token.split('.')[1], 'base64url').toString());
-    if (payload.exp) expiresAt = new Date(payload.exp * 1000).toISOString();
-    subject = payload.display_name || payload.phone_number || payload.username || null;
-  } catch { /* opaque token — fine */ }
-
-  return {
-    present: true,
-    fromEnv: !stored && Boolean(process.env.BR_TOKEN),
-    savedAt: (await getMeta('br_token_saved_at')) || null,
-    expiresAt,
-    expired: expiresAt ? Date.parse(expiresAt) < Date.now() : null,
-    subject: subject ? String(subject).replace(/(\d{3})\d+(\d{2})/, '$1***$2') : null,
-    preview: `${token.slice(0, 8)}…${token.slice(-6)}`,
-    ...(await (async () => {
-      const d = await getDeviceIdentity();
-      return { hasDeviceId: Boolean(d.deviceId), hasDeviceKey: Boolean(d.deviceKey) };
-    })()),
-  };
-}
 
 /* ------------------------------- helpers ------------------------------- */
 
@@ -235,17 +192,29 @@ async function stationIndex() {
  * person's alarms from another's, so it travels in a header rather than the
  * query string (which would land in logs and Referer).
  */
-function notifyTokenOf(req) {
-  const header = req?.headers?.['x-notify-token'];
-  return Array.isArray(header) ? header[0] : header || null;
+/**
+ * Demand a signed-in user.
+ *
+ * `needsLogin` is what tells the browser to open the sign-in panel rather than
+ * show a bare error — the dashboard itself never calls anything guarded, so a
+ * visitor only ever meets this by reaching for something that is genuinely
+ * theirs.
+ */
+async function requireUser(req, what = 'This') {
+  const user = await currentUser(req);
+  if (!user) {
+    throw new HttpError(401, `${what} is tied to your account. Connect Telegram to sign in.`, {
+      needsLogin: true, needsPairing: true,
+    });
+  }
+  return user;
 }
 
-async function requireSubscriber(req) {
-  const subscriber = await subscriberByToken(notifyTokenOf(req));
-  if (!subscriber) {
-    throw new HttpError(401, 'Connect Telegram first to manage sale alarms.', { needsPairing: true });
-  }
-  return subscriber;
+
+async function callerCredentials(req) {
+  const user = await currentUser(req);
+  if (!user) return { token: null, deviceId: null, deviceKey: null };
+  return userCredentials(user.id);
 }
 
 async function resolveStation(input, field) {
@@ -295,23 +264,23 @@ async function runSync() {
 }
 
 const handlers = {
-  'GET /api/meta': async () => {
+  'GET /api/meta': async ({ req }) => {
+    const user = await currentUser(req);
     const [catalog, token, overview, saleOpenTime, release] = await Promise.all([
-      catalogStatus(), tokenInfo(), historyOverview(),
+      catalogStatus(),
+      user ? userTokenInfo(user.id) : Promise.resolve({ present: false }),
+      historyOverview(),
       effectiveSaleOpenTime(), saleReleaseEvidence(),
     ]);
     return {
       catalog,
+      account: user
+        ? { signedIn: true, displayName: user.displayName || null, since: user.createdAt }
+        : { signedIn: false },
       token,
       window: bookingWindow(),
       advanceDays: ADVANCE_DAYS,
       today: todayISO(),
-      /**
-       * The single source of truth for every "when do seats appear" string in
-       * the UI. Sections that have no search result to read it from (the alarm
-       * explainer, for one) used to hard-code midnight and disagreed with the
-       * countdown; they read this instead.
-       */
       saleOpen: {
         time: saleOpenTime.slice(0, 5),
         source: saleOpenTimeSource(),
@@ -337,12 +306,12 @@ const handlers = {
   },
 
   /** The main search: offline plan + live seats when a token exists. */
-  'GET /api/search': async ({ query }) => {
+  'GET /api/search': async ({ query, req }) => {
     const fromCity = await resolveStation(query.get('from'), 'from');
     const toCity = await resolveStation(query.get('to'), 'to');
     if (fromCity === toCity) throw new HttpError(400, 'Origin and destination must be different stations');
     const dateISO = requireDate(query.get('date'));
-    const token = await getToken();
+    const token = await callerCredentials(req);
 
     const result = await fullAvailability({ fromCity, toCity, dateISO, token });
 
@@ -366,13 +335,13 @@ const handlers = {
   },
 
   /** Earliest date on this route that actually has a seat. */
-  'GET /api/earliest': async ({ query }) => {
+  'GET /api/earliest': async ({ query, req }) => {
     const fromCity = await resolveStation(query.get('from'), 'from');
     const toCity = await resolveStation(query.get('to'), 'to');
     if (fromCity === toCity) throw new HttpError(400, 'Origin and destination must be different stations');
     const seatClass = query.get('class') || null;
     if (seatClass && !SEAT_CLASSES.includes(seatClass)) throw new HttpError(400, `Unknown seat class "${seatClass}"`);
-    return earliestBookable({ fromCity, toCity, token: await getToken(), seatClass });
+    return earliestBookable({ fromCity, toCity, token: await callerCredentials(req), seatClass });
   },
 
   /**
@@ -432,7 +401,8 @@ const handlers = {
 
   'GET /api/watchlist': async () => ({ watches: await listWatches() }),
 
-  'POST /api/watchlist': async ({ body }) => {
+  'POST /api/watchlist': async ({ body, req }) => {
+    await requireUser(req, 'The shared watchlist');
     const fromCity = await resolveStation(body.from, 'from');
     const toCity = await resolveStation(body.to, 'to');
     if (fromCity === toCity) throw new HttpError(400, 'Origin and destination must be different stations');
@@ -440,7 +410,8 @@ const handlers = {
     return { ok: true, watches: await listWatches() };
   },
 
-  'DELETE /api/watchlist': async ({ query }) => {
+  'DELETE /api/watchlist': async ({ query, req }) => {
+    await requireUser(req, 'The shared watchlist');
     await removeWatch(
       await resolveStation(query.get('from'), 'from'),
       await resolveStation(query.get('to'), 'to'),
@@ -448,46 +419,55 @@ const handlers = {
     return { ok: true, watches: await listWatches() };
   },
 
-  'POST /api/collect': async () => collectOnce({ token: await getToken() }),
+  /** A manual history sweep, run under the caller's own railway session. */
+  'POST /api/collect': async ({ req }) => {
+    const user = await requireUser(req, 'Recording availability history');
+    return collectOnce({ token: await userCredentials(user.id) });
+  },
 
-  'GET /api/token': async () => tokenInfo(),
+  'GET /api/token': async ({ req }) => {
+    const user = await requireUser(req, 'Your Bangladesh Railway session');
+    return userTokenInfo(user.id);
+  },
 
-  'POST /api/token': async ({ body }) => {
+  'POST /api/token': async ({ body, req }) => {
+    const user = await requireUser(req, 'Your Bangladesh Railway session');
+
     // Accepts a bare JWT or the JSON blob the Settings snippet copies.
     const creds = normalizeCredentials(body.token);
     const { token } = creds;
 
     if (!token) {
-      await setToken('');
-      await setDeviceCredentials({ deviceId: '', deviceKey: '' });
-      return { ok: true, cleared: true, token: await tokenInfo() };
+      await setUserCredentials(user.id, { token: '', deviceId: null, deviceKey: null });
+      return { ok: true, cleared: true, token: await userTokenInfo(user.id) };
     }
     if (token.split('.').length < 3 || token.length < 40) {
       throw new HttpError(400, 'That does not look like a session token. Use the snippet in these instructions, or copy the full value of the "token" key from local storage on eticket.railway.gov.bd.');
     }
 
-    // Probe with the device identity that came with this paste, falling back
-    // to whatever was stored before, so a token-only re-paste still works.
-    const existing = await getDeviceIdentity();
+    // Probe with the device identity that came with this paste, falling back to
+    // the one already on this user's row so a token-only re-paste still works.
+    // Passed as per-call credentials rather than by mutating the process-wide
+    // device identity: that is shared by every in-flight request, and two
+    // people saving a token at once would send each other's device headers.
+    const existing = await userCredentials(user.id);
     const deviceId = creds.deviceId || existing.deviceId;
     const deviceKey = creds.deviceKey || existing.deviceKey;
-    setDeviceIdentity({ deviceId, deviceKey });
 
-    const probe = await checkToken(token, { dateISO: addDays(todayISO(), 1) });
+    const probe = await checkToken({ token, deviceId, deviceKey }, { dateISO: addDays(todayISO(), 1) });
     if (!probe.valid) {
-      setDeviceIdentity(existing); // Leave the working state untouched.
       throw new HttpError(400, explainRejection(token, probe.reason, Boolean(deviceId)), {
         hasDeviceId: Boolean(deviceId),
         expiresAt: jwtExpiry(token)?.toISOString() || null,
       });
     }
 
-    await setToken(token);
-    await setDeviceCredentials({ deviceId, deviceKey });
-    return { ok: true, token: await tokenInfo() };
+    await setUserCredentials(user.id, { token, deviceId, deviceKey });
+    return { ok: true, token: await userTokenInfo(user.id) };
   },
 
-  'POST /api/sync': async () => {
+  'POST /api/sync': async ({ req }) => {
+    await requireUser(req, 'Rebuilding the train catalog');
     // ~134 upstream requests at 350ms apart. A function invocation is killed
     // long before that, and a half-finished crawl inside a transaction would
     // just roll back — so say why instead of appearing to start.
@@ -519,35 +499,53 @@ const handlers = {
 
   /* ----------------------------- sale alarms ---------------------------- */
 
+  /**
+   * Bot facts are scoped to the viewer.
+   *
+   * A bot belongs to a person now, so an anonymous caller learns only whether
+   * this site offers a shared bot to pair with — not whose bot is installed,
+   * not its masked token, and not its webhook. notifyStatus() enforces that;
+   * this only supplies the viewer.
+   */
   'GET /api/notify/status': async ({ req }) => {
-    const status = await notifyStatus();
-    const subscriber = await subscriberByToken(notifyTokenOf(req));
+    const user = await currentUser(req);
+    const status = await notifyStatus({ user });
     return {
       ...status,
       limit: MAX_ALERTS_PER_SUBSCRIBER,
-      connected: Boolean(subscriber),
-      subscriber: subscriber ? { id: subscriber.id, displayName: subscriber.displayName } : null,
+      connected: Boolean(user),
+      subscriber: user ? { id: user.id, displayName: user.displayName } : null,
+      botConfigured: status.configured,
     };
   },
 
   /**
-   * The bot token, managed from the UI and stored in the database like the
-   * Bangladesh Railway session token. Saving it verifies against getMe first
-   * and takes effect immediately — the update loop picks it up without a
-   * restart. The token itself is never returned, only a masked preview.
+   * Connect a bot you made with @BotFather.
+   *
+   * Open to anonymous callers on purpose: pasting a bot token is how you sign
+   * up, and requiring an account first would be circular. The token itself is
+   * the credential — connectBot() refuses one that already belongs to somebody
+   * else's account, and the first chat to pair claims it.
    */
-  'POST /api/notify/bot': async ({ body }) => {
-    const res = await setBotToken(body.token);
-    return { ...res, status: await notifyStatus() };
+  'POST /api/notify/bot': async ({ body, req }) => {
+    const user = await currentUser(req);
+    const res = await connectBot(body.token, { user, log: console.log });
+    return { ...res, status: await notifyStatus({ user }) };
   },
 
-  'DELETE /api/notify/bot': async () => {
-    await setBotToken('');
-    return { cleared: true, status: await notifyStatus() };
+  'DELETE /api/notify/bot': async ({ req }) => {
+    const user = await requireUser(req, 'Disconnecting the Telegram bot');
+    const res = await disconnectBot(user, { log: console.log });
+    // The caller's own account went with the bot, so the status they get back
+    // is the signed-out one — which is exactly what their browser now is.
+    return { ...res, status: await notifyStatus({ user: null }) };
   },
 
   /** Step 1 of pairing: hand the browser a code and the t.me link carrying it. */
-  'POST /api/notify/pair': async () => createPairing(),
+  'POST /api/notify/pair': async ({ body, req }) => createPairing({
+    botId: body.bot || null,
+    user: await currentUser(req),
+  }),
 
   /** Step 2: the browser polls until the bot has seen `/start <code>`. */
   'GET /api/notify/pair': async ({ query }) => {
@@ -557,12 +555,12 @@ const handlers = {
   },
 
   'GET /api/notify/alerts': async ({ req }) => {
-    const subscriber = await requireSubscriber(req);
+    const subscriber = await requireUser(req, 'Sale alarms');
     return listAlerts(subscriber.id);
   },
 
   'POST /api/notify/alerts': async ({ body, req }) => {
-    const subscriber = await requireSubscriber(req);
+    const subscriber = await requireUser(req, 'Sale alarms');
     const fromCity = await resolveStation(body.from, 'from');
     const toCity = await resolveStation(body.to, 'to');
     const dateISO = requireDate(body.date);
@@ -571,12 +569,9 @@ const handlers = {
     return { alert, ...(await listAlerts(subscriber.id)) };
   },
 
-  /**
-   * Fire a drill down the real scheduling path, so what it proves is that the
-   * real one works — not merely that a message can be sent.
-   */
+
   'POST /api/notify/test': async ({ body, req }) => {
-    const subscriber = await requireSubscriber(req);
+    const subscriber = await requireUser(req, 'Sale alarms');
     const alert = await sendTestAlarm({
       subscriber,
       fromCity: body.from ? await resolveStation(body.from, 'from') : null,
@@ -588,7 +583,7 @@ const handlers = {
   },
 
   'DELETE /api/notify/alerts': async ({ query, req }) => {
-    const subscriber = await requireSubscriber(req);
+    const subscriber = await requireUser(req, 'Sale alarms');
     const id = Number(query.get('id'));
     if (!Number.isFinite(id)) throw new HttpError(400, '"id" is required');
     await cancelAlert(subscriber.id, id);

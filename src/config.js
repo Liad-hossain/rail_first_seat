@@ -221,6 +221,25 @@ export const ALARM_MAX_RINGS = 120;
  */
 export const ALARM_TRIGGER_TAG = '#RAILALARM';
 
+/**
+ * The matching marker for "stop ringing".
+ *
+ * Acknowledging an alarm EDITS the ringing message, and Telegram raises no
+ * Android notification for an edit — so an automation can never see it. A
+ * separate, silent message carrying this tag is what gives the phone something
+ * to match on. Silent so stopping the alarm does not itself make a sound.
+ *
+ * Deliberately not a substring of ALARM_TRIGGER_TAG, so a macro matching the
+ * start tag cannot re-fire on a stop message.
+ *
+ * Note the limit: Telegram suppresses notifications for the chat currently on
+ * screen, which is exactly where you are when you tap the button. This tag is
+ * therefore reliable for stopping the phone from ANOTHER device (Telegram
+ * Desktop, a second phone) and unreliable for stopping it from the handset
+ * doing the ringing — that wants a device-side trigger instead.
+ */
+export const ALARM_STOP_TAG = '#RAILSTOP';
+
 /** A drill proves the behaviour; it does not need a quarter of an hour. */
 export const ALARM_TEST_DURATION_MS = 90_000;
 

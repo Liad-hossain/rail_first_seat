@@ -12,10 +12,13 @@
 import { TELEGRAM_API, TELEGRAM_BOT_TOKEN } from './config.js';
 
 /**
- * The bot token is supplied at runtime, not at import time: it is saved from
- * the Settings UI into the database, so it can change while the server runs.
- * `notify.js` installs the real provider at boot; the env var is only a
- * fallback for a deployment that would rather not use the UI.
+ * The *default* bot token, supplied at runtime rather than at import time.
+ *
+ * Bots are per-user, so almost every call names its own token explicitly. This
+ * provider is only the fallback: the deployment's own TELEGRAM_BOT_TOKEN bot,
+ * used for the shared bot a visitor with no bot of their own pairs with, and by
+ * anything that legitimately has no user in scope. `notify.js` installs the
+ * real provider at boot.
  */
 let tokenProvider = async () => TELEGRAM_BOT_TOKEN;
 
@@ -150,7 +153,18 @@ export async function getWebhookInfo({ token = null } = {}) {
   return callApi('getWebhookInfo', {}, { token });
 }
 
-export async function sendMessage(chatId, text, { buttons = null, silent = false } = {}) {
+/**
+ * Every outbound call names the bot it is sending as.
+ *
+ * Bots are per-user now, so "the" token no longer exists: a message for one
+ * account must go out through that account's own bot or it lands in a stranger's
+ * chat — or, more likely, nowhere. `token` is threaded through explicitly rather
+ * than read from ambient state so the compiler-of-last-resort (a missing
+ * argument) fails loudly instead of quietly sending as the wrong bot. Omitting
+ * it falls back to the configured default bot, which is what the single-bot
+ * deployment and the tests rely on.
+ */
+export async function sendMessage(chatId, text, { buttons = null, silent = false, token = null } = {}) {
   return callApi('sendMessage', {
     chat_id: chatId,
     text,
@@ -158,23 +172,23 @@ export async function sendMessage(chatId, text, { buttons = null, silent = false
     disable_web_page_preview: true,
     disable_notification: silent,
     ...(buttons ? { reply_markup: { inline_keyboard: buttons } } : {}),
-  });
+  }, { token });
 }
 
 /**
  * Remove a previous ring. Failure is expected and harmless — the user may have
  * deleted it, or it may be older than Telegram's 48-hour deletion window.
  */
-export async function deleteMessage(chatId, messageId) {
+export async function deleteMessage(chatId, messageId, { token = null } = {}) {
   if (!messageId) return false;
   try {
-    await callApi('deleteMessage', { chat_id: chatId, message_id: messageId });
+    await callApi('deleteMessage', { chat_id: chatId, message_id: messageId }, { token });
     return true;
   } catch { return false; }
 }
 
 /** Rewrite a message in place. Editing does NOT produce a notification. */
-export async function editMessageText(chatId, messageId, text, { buttons = null } = {}) {
+export async function editMessageText(chatId, messageId, text, { buttons = null, token = null } = {}) {
   if (!messageId) return false;
   try {
     await callApi('editMessageText', {
@@ -184,14 +198,14 @@ export async function editMessageText(chatId, messageId, text, { buttons = null 
       parse_mode: 'HTML',
       disable_web_page_preview: true,
       ...(buttons ? { reply_markup: { inline_keyboard: buttons } } : {}),
-    });
+    }, { token });
     return true;
   } catch { return false; }
 }
 
 /** Clears the spinner on a tapped inline button; Telegram requires an answer. */
-export async function answerCallback(callbackQueryId, text = '') {
-  return callApi('answerCallbackQuery', { callback_query_id: callbackQueryId, text, show_alert: false })
+export async function answerCallback(callbackQueryId, text = '', { token = null } = {}) {
+  return callApi('answerCallbackQuery', { callback_query_id: callbackQueryId, text, show_alert: false }, { token })
     .catch(() => null); // Purely cosmetic — never fail an ack over it.
 }
 
@@ -210,8 +224,15 @@ export async function answerCallback(callbackQueryId, text = '') {
  *   webhook and must NOT poll — otherwise running this locally against a
  *   production database silently kills the deployed site's inbound updates.
  */
+/**
+ * @param {string} [token] Poll this exact bot rather than the default one.
+ *   With bots per user there are N loops, one per bot, each with its own
+ *   cursor — `getOffset`/`setOffset` are per-bot too. Passing no token keeps
+ *   the original single-bot behaviour of following whatever is configured.
+ */
 export function startTelegramListener({
   getOffset, setOffset, onMessage, onCallback, isWebhookMode = async () => false,
+  token: fixedToken = null,
   log = console.log,
 }) {
   let stopped = false;
@@ -224,7 +245,7 @@ export function startTelegramListener({
 
   (async () => {
     while (!stopped) {
-      const token = await currentToken();
+      const token = fixedToken || await currentToken();
 
       if (!token) {
         if (announced !== null) {

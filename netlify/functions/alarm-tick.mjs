@@ -7,31 +7,35 @@
  * when an alarm is about to become due. Expect a few seconds of lag rather
  * than a few hundred milliseconds.
  */
-import { runAlarmTick, resyncAlertOpenTimes, ensureWebhook } from '../../src/notify.js';
+import { runAlarmTick, resyncAlertOpenTimes, ensureWebhook, ensureBots } from '../../src/notify.js';
 import { probeSaleRelease } from '../../src/history.js';
-import { migrate, getMeta } from '../../src/db.js';
-import { setDeviceIdentity } from '../../src/shohoz.js';
+import { migrate } from '../../src/db.js';
+import { serviceCredentials } from '../../src/session.js';
 
 let schemaReady = false;
 
 export default async () => {
   if (!schemaReady) { await migrate(); schemaReady = true; }
 
+  // Seeds the shared bot from TELEGRAM_BOT_TOKEN. Idempotent, and one indexed
+  // lookup once the row exists.
+  try { await ensureBots({ log: console.log }); }
+  catch (err) { console.error(`shared bot: ${err.message}`); }
+
   // Inbound updates die silently if the webhook is cleared — outbound keeps
-  // working, so nothing looks wrong until a button press does nothing.
+  // working, so nothing looks wrong until a button press does nothing. This is
+  // also what moves each bot from the old pathless webhook to its own URL.
   try { await ensureWebhook({ log: console.log }); }
   catch (err) { console.error(`webhook check: ${err.message}`); }
 
   // A once-a-minute cron is exactly the cadence the release probe wants, so it
   // rides along rather than needing a scheduled function of its own.
   try {
-    const token = (await getMeta('br_token')) || process.env.BR_TOKEN || null;
-    if (token) {
-      setDeviceIdentity({
-        deviceId: (await getMeta('br_device_id')) || process.env.BR_DEVICE_ID || null,
-        deviceKey: (await getMeta('br_device_key')) || process.env.BR_DEVICE_KEY || null,
-      });
-      const probe = await probeSaleRelease({ token, log: console.log });
+    // Per-user sessions: run on the designated background credentials rather
+    // than a site-wide token that no longer exists.
+    const creds = await serviceCredentials();
+    if (creds.token) {
+      const probe = await probeSaleRelease({ token: creds, log: console.log });
       if (probe.measured) await resyncAlertOpenTimes({ log: console.log });
     }
   } catch (err) {

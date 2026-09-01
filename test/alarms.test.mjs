@@ -59,16 +59,29 @@ const {
 
 await migrate();
 
-// A throwaway subscriber, so a real paired chat is never touched.
+/**
+ * A throwaway bot and a throwaway subscriber on it, so a real paired chat is
+ * never touched. An account is a chat ON A BOT now, and a ring goes out through
+ * that bot's token — an account with no bot has nothing to ring through.
+ * Deliberately not the shared bot: these run against a real database that may
+ * already have one, and there can only be one.
+ */
+const botToken = `${900000000 + Math.floor(Math.random() * 99999999)}:test-${crypto.randomUUID()}`;
+const bot = await one(
+  `INSERT INTO bots (bot_id, token, username, name)
+   VALUES (split_part($1,':',1), $1, 'test_bot', 'Test') RETURNING id, bot_id`,
+  [botToken],
+);
 const chatId = `test-${crypto.randomUUID()}`;
 const subscriber = await one(
-  `INSERT INTO notify_subscribers (chat_id, display_name, access_token, created_at)
-   VALUES ($1,'Test User',$2,now()) RETURNING id, chat_id, display_name`,
-  [chatId, crypto.randomUUID()],
+  `INSERT INTO notify_subscribers (bot_id, chat_id, display_name, access_token, created_at)
+   VALUES ($1,$2,'Test User',$3,now()) RETURNING id, chat_id, display_name`,
+  [bot.id, chatId, crypto.randomUUID()],
 );
 
 after(async () => {
   await query('DELETE FROM notify_subscribers WHERE chat_id = $1', [chatId]); // cascades to alerts
+  await query('DELETE FROM bots WHERE id = $1', [bot.id]);
   await closePool();
 });
 

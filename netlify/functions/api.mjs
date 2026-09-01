@@ -8,6 +8,7 @@
  */
 import { dispatch, SECURITY_HEADERS } from '../../src/server.js';
 import { migrate } from '../../src/db.js';
+import { ensureBots } from '../../src/notify.js';
 
 /**
  * The schema is idempotent and guarded by an advisory lock, so running it once
@@ -18,6 +19,10 @@ let schemaReady = false;
 async function ensureSchema() {
   if (schemaReady) return;
   await migrate();
+  // The shared bot is part of "this deployment is set up": without it a fresh
+  // container would report no bot at all until the next cron pass.
+  await ensureBots({ log: console.log }).catch((err) =>
+    console.error(`shared bot: ${err.message}`));
   schemaReady = true;
 }
 

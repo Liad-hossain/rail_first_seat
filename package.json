@@ -11,7 +11,7 @@
     "db:setup": "node scripts/db-setup.js",
     "sync": "node scripts/sync-catalog.js",
     "snapshot": "node scripts/run-snapshot.js",
-    "test": "node --experimental-test-module-mocks --test-concurrency=1 --test test/live-merge.test.mjs test/alarms.test.mjs test/credentials.test.mjs test/sale-time.test.mjs"
+    "test": "node --experimental-test-module-mocks --test-concurrency=1 --test test/live-merge.test.mjs test/alarms.test.mjs test/credentials.test.mjs test/sale-time.test.mjs test/stop-signal.test.mjs test/accounts.test.mjs"
   },
   "dependencies": {
     "pg": "^8.13.1"

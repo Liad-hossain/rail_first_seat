@@ -185,9 +185,62 @@ which dates are buyable now and when each future date unlocks.
 
 ---
 
+## Accounts
+
+The site is public. Schedules, sale-open times, the countdown, the calendar and
+the shared availability history all work with **no account** — that is most of
+what it does, and none of it should ask you to sign in.
+
+An account appears only where the data is genuinely *yours*:
+
+| Needs an account | Why |
+| --- | --- |
+| Your sale alarms | they ring in your Telegram chat |
+| Your Bangladesh Railway session | it is your e-ticket login |
+| Your Telegram bot | it is yours, and only you can change or disconnect it |
+| Changing the tracked routes or re-syncing the catalog | they affect everyone |
+
+**Signing in is connecting Telegram — that is the whole login.** No password, no
+email, nothing to reset. Pairing a chat mints a random bearer secret
+(`notify_subscribers.access_token`); the browser keeps it in `localStorage` and
+sends it as `x-notify-token`. Signing out just forgets it locally; your alarms
+and session stay on the server.
+
+Two consequences worth stating plainly:
+
+- **Your railway session is yours alone.** It used to be one site-wide value in
+  `meta`, which meant every visitor shared — and could overwrite — one person's
+  e-ticket login. It now lives on your own row, and nobody else's search can
+  ride on it. The raw token is never sent back to any browser, including yours.
+- **Your Telegram bot is yours alone.** It used to be one site-wide token in
+  `meta`: everyone paired with whichever bot happened to be installed, an
+  anonymous visitor could read its `@username` and masked token, and *any*
+  signed-in account could swap or delete it out from under everybody else. A bot
+  is now a row you own — the first chat to pair on it claims it, and from then
+  on only that account may replace or disconnect it. Nobody else, signed in or
+  not, learns it exists.
+- **Pasting a bot token needs no account, on purpose.** It is how you sign up,
+  and requiring an account first would be circular. The token *is* the
+  credential: one that already belongs to another account is refused.
+- **Disconnecting a bot is destructive.** An account is a chat *on a bot*, so
+  removing the bot removes every account paired through it and their alarms —
+  an alarm with no bot to ring through can never fire. The UI says how many
+  before and after.
+
+`TELEGRAM_BOT_TOKEN`, if the deployment sets one, seeds a single **shared** bot
+that a visitor with no bot of their own may still pair with. It has no owner and
+cannot be changed from the UI. Leave it empty and everyone brings their own.
+
+Background work — the hourly collector, the sale-release probe, the `alarm-tick`
+cron — has no user, so it runs on `BR_TOKEN` if set, otherwise on the most
+recently saved user session. Set `BR_TOKEN` if you want that to be deterministic.
+
+---
+
 ## Live seat counts (optional)
 
-Everything above works with no login. Seat counts and fares need one.
+Everything above works with no account. Seat counts and fares need one, plus
+your own railway session.
 
 Bangladesh Railway protects its sign-in with a Cloudflare Turnstile challenge,
 so this site **cannot and does not** log in for you. Instead it reuses your own
@@ -258,16 +311,21 @@ cron — the interesting moments are just after the two daily releases:
 The sale moment is deterministic, so you should not have to sit and watch a
 countdown. Set an alarm and Telegram rings you the second the date opens.
 
-**Setup, once.** Talk to [@BotFather](https://t.me/BotFather), send `/newbot`,
-and copy the token it hands back. Open **Alarms** in the top bar and paste it
-there — no file editing and no restart. It is verified against Telegram's
-`getMe` before being stored, so a truncated paste is caught immediately, and it
-is kept in the database beside the Bangladesh Railway session token. The API
-never gives it back; only a masked preview like `123456789:••••••Dsaw`.
+**Setup, once.** Alarms are delivered by a bot **you** own. Talk to
+[@BotFather](https://t.me/BotFather), send `/newbot`, and copy the token it
+hands back. Open **Alarms** in the top bar and paste it there — no file editing
+and no restart. It is verified against Telegram's `getMe` before being stored,
+and kept in the database. The API never gives it back; only a masked preview
+like `123456789:••••••Dsaw`, and only to you.
+
+If the deployment configured a shared bot (`TELEGRAM_BOT_TOKEN`), you can skip
+all of that and press *Connect Telegram* to pair with it instead.
 
 Then press *Connect Telegram* and tap the link. That binds this browser to your
 chat — the only things stored about you are your Telegram chat id and display
-name.
+name — and it is also what **claims** the bot: the first chat to pair on a bot
+becomes its owner. A pairing code is minted for one specific bot and is not
+redeemable on any other.
 
 **If pressing Start does nothing**, it is almost always one of these:
 
@@ -283,9 +341,12 @@ name.
   only one, at random. The log says `getUpdates conflict`. Stop the extra copy
   (`lsof -nP -iTCP:8787 -sTCP:LISTEN`) or give the second one its own bot.
 
-Swapping the bot later is handled: the update cursor is reset (update ids are
-numbered per bot) and you are told how many existing chats belonged to the old
-bot and must reconnect. Disconnecting pauses alarms without deleting them.
+Each bot is polled on its own loop with its own cursor (update ids are numbered
+per bot), and on serverless each gets its own webhook path,
+`/api/telegram/webhook/<bot id>` — an incoming update carries nothing that says
+which bot received it, so it has to come from the URL. The set of loops is
+reconciled every few seconds, so connecting a bot starts listening to it without
+a restart.
 
 **Then**, search any date that is not on sale yet and press *Alarm me when this
 opens*. You may hold **3 alarms at a time**; the panel shows how many slots are
@@ -304,7 +365,8 @@ sent once and carries `#RAILALARM`, which a phone automation uses to start a
 real looping system alarm (see below). Delivery is retried behind the scenes for
 up to 15 minutes if Telegram is slow or times out, but only ever **one** message
 arrives. Tapping *Stop alarm* rewrites it as *Alarm stopped* with a *Book now*
-deep link. If the server was down at the opening moment the alarm still goes
+deep link, and sends a separate silent `#RAILSTOP` message for phone automations
+(an edited message raises no notification, so the edit alone cannot reach one). If the server was down at the opening moment the alarm still goes
 out, flagged as late.
 
 To go back to Telegram-only repeat ringing, set `ALARM_REPEAT = true` in
@@ -333,6 +395,31 @@ whole chain without waiting for a sale.
 message and never varies with route, date or wording. Do not reword it without
 updating the macro.
 
+#### Stopping it again
+
+The phone started the sound, so the phone must stop it — and the *Stop alarm*
+button cannot be the thing that does it. Tapping it means the chat is on screen,
+and Telegram posts **no notification for the chat you are currently looking at**;
+acknowledging also *edits* the ringing message, and an edit never raises a
+notification either. There is nothing for a macro to match. Build the stop on a
+device-side signal:
+
+| | |
+| --- | --- |
+| Trigger | Device Events → **Notification Removed** (a.k.a. *Cleared*) → app **Telegram** → text contains `#RAILALARM` |
+| Action | Media → **Stop Sound/Vibrate** |
+
+Opening the chat or swiping the alarm away clears that notification, so the sound
+stops exactly when you deal with the alarm. Add a MacroDroid **Quick Settings
+tile** or home-screen widget running *Stop Sound/Vibrate* as the manual
+fallback — that one always works.
+
+Tapping *Stop alarm* from **another** device (Telegram Desktop, a tablet) is the
+one case the ringing handset can automate, because the chat is not on its screen.
+A silent message carrying `#RAILSTOP` (`ALARM_STOP_TAG`) is sent on every
+acknowledgement and on `/stop`; match it with **Notification Received** →
+**Stop Sound/Vibrate**. Treat it as a bonus, not the primary stop.
+
 **iPhone** — iOS gives no app or Shortcut a way to react to another app's
 notification, so this approach simply is not available. The realistic options
 are Telegram's own loudest sound with *override mute* enabled, or producing the
@@ -354,9 +441,9 @@ carries the same *Stop alarm* button so you can confirm that works, and does
 
 In the chat: `/alerts` lists what is pending, `/stop` cancels everything.
 
-With no bot connected the feature switches itself off cleanly — the panel shows
-the setup steps instead — and the rest of the site is unaffected. Alarms already
-pending are kept, and ring as soon as a bot is connected again.
+With no bot connected anywhere the feature switches itself off cleanly — the
+panel shows the setup steps instead — and the rest of the site is unaffected.
+Alarms already pending are kept, and ring as soon as a bot is connected again.
 
 ---
 
@@ -377,7 +464,7 @@ All environment variables. Only the first is required.
 | `BR_DEVICE_KEY` | — | The `ssdk` value, when the site has one |
 | `BR_API_BASE` | upstream | Override the API base URL. Testing seam. |
 | `BR_WATCH` | — | Routes to seed the watchlist, e.g. `Dhaka>Sreemangal,Dhaka>Sylhet` |
-| `TELEGRAM_BOT_TOKEN` | — | Optional fallback for the bot token. Normally you paste it in the Alarms panel instead; a token saved there always wins. |
+| `TELEGRAM_BOT_TOKEN` | — | Optional **shared** bot, for visitors with no bot of their own. Bots are per user; everyone else pastes their own in the Alarms panel. |
 | `BR_CRAWL_DELAY_MS` | `350` | Politeness delay between catalog requests |
 
 ---
@@ -465,10 +552,14 @@ strictly worse than running a persistent process.
    # "last_error_message": "Wrong response from the webhook: 503 Service Unavailable"
    #   -> TELEGRAM_WEBHOOK_SECRET is missing on the host
    ```
-5. **Deploy**, then open the site, paste the bot token in **Alarms** and the
-   session token in **Settings**. Saving the bot token registers the webhook at
-   `https://<your-site>/api/telegram/webhook` automatically — the panel confirms
-   with *webhook registered*.
+5. **Deploy**, then open the site, paste your bot token in **Alarms** and your
+   session token in **Settings**. Saving a bot token registers its webhook at
+   `https://<your-site>/api/telegram/webhook/<bot id>` automatically — one path
+   per bot, because an update does not say which bot it was sent to. The panel
+   confirms with *webhook registered*.
+
+   Set `TELEGRAM_BOT_TOKEN` as well if you want a shared bot that visitors can
+   pair with without making one of their own.
 6. **Check the crons** under *Site configuration → Functions → Scheduled
    functions*. `alarm-tick` should be listed as running every minute.
 
@@ -482,13 +573,14 @@ strictly worse than running a persistent process.
   once-a-minute cron is ~43,200 invocations/month before any traffic; check the
   current limit before relying on it.
 - If you later move back to a persistent host, set `TELEGRAM_POLLING=1` and
-  re-save the bot token — it clears the webhook and returns to long-polling.
+  re-save each bot token — it clears that bot's webhook and returns to
+  long-polling.
 - **Do not run `npm start` locally against the deployed database** without
   `TELEGRAM_POLLING=1`. Polling and webhooks are mutually exclusive, and a
   local run used to clear the deployed webhook the moment it saw the token.
-  The listener now detects that a webhook is in charge (recorded in
-  `meta.telegram_delivery_mode`), refuses to poll and leaves it alone, and the
-  alarm cron re-registers the webhook if it ever goes missing.
+  Each listener now detects that a webhook is in charge of its bot (recorded in
+  `bots.delivery_mode`), refuses to poll and leaves it alone, and the alarm cron
+  re-registers every bot's webhook if one ever goes missing.
 
 ---
 
@@ -504,7 +596,9 @@ src/
   availability.js the three "first availability" answers
   history.js      snapshot recording, history digests, hourly collector
   telegram.js     Bot API transport and the long-poll update loop (no deps)
+  bots.js         the bot registry: whose bot is whose, and who may change it
   notify.js       alarm rules, the 3-per-person cap, pairing, the scheduler
+  session.js      who is signed in, and their own railway session
   server.js       routes, validation, security headers, transport-agnostic dispatch()
   serve.js        Node entry point: HTTP listener + background workers
 web/
@@ -519,6 +613,9 @@ test/
   live-merge.test.mjs   seat parsing and catalog merge
   alarms.test.mjs       alarm rules and firing precision
   credentials.test.mjs  token normalisation and the device headers
+  accounts.test.mjs     what is public, what needs an account, what stays private
+  sale-time.test.mjs    the measured release time and alarm re-timing
+  stop-signal.test.mjs  the stop tag a phone automation matches on
 ```
 
 ---
@@ -535,21 +632,29 @@ GET  /api/destinations?from=…
 GET  /api/history[?from=…&to=…&date=…]
 GET  /api/meta
 GET  /api/health
-POST /api/token       { token }
-POST /api/sync
-POST /api/collect
-GET|POST|DELETE /api/watchlist
+GET  /api/token                           your own session, masked   (x-notify-token)
+POST /api/token       { token }           save/clear your session     (x-notify-token)
+POST /api/sync                                                        (x-notify-token)
+POST /api/collect                         sweep under your session    (x-notify-token)
+GET  /api/watchlist                       public
+POST|DELETE /api/watchlist                                            (x-notify-token)
 
-GET    /api/notify/status                 is a bot connected, is this browser paired
-POST   /api/notify/bot     { token }      verify with getMe and store it; takes effect live
-DELETE /api/notify/bot                    disconnect the bot (alarms are kept)
-POST   /api/notify/pair                   mint a pairing code + t.me deep link
+GET    /api/notify/status                 YOUR bot + whether this browser is signed in
+POST   /api/notify/bot     { token }      verify with getMe and store it; no account needed
+DELETE /api/notify/bot                    disconnect YOUR bot — removes the accounts
+                                          paired through it, yours included (x-notify-token)
+POST   /api/notify/pair    { bot? }       mint a pairing code + t.me deep link for one bot
 GET    /api/notify/pair?code=…            poll until the bot sees /start <code>
-GET    /api/notify/alerts                 list your alarms          (x-notify-token)
+GET    /api/notify/alerts                 list YOUR alarms only     (x-notify-token)
 POST   /api/notify/alerts  { from, to, date }                       (x-notify-token)
 DELETE /api/notify/alerts?id=…                                      (x-notify-token)
 POST   /api/notify/test    { from?, to?, date?, delaySeconds? }     (x-notify-token)
 ```
+
+Routes marked `(x-notify-token)` return `401 { needsLogin: true }` without a
+session; everything else is public. `/api/search` and `/api/earliest` accept the
+header optionally — with it you get live seat counts from your own railway
+session, without it the offline answer.
 
 Dates accept `YYYY-MM-DD` or `DD-MMM-YYYY`. Station names are matched
 case-insensitively and accept either the display form (`Biman Bandar`) or the

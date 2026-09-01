@@ -14,7 +14,9 @@ const state = {
   earliest: null,
   countdownTimer: null,
   searching: false,
-  notify: { status: null, alerts: null, pollTimer: null },
+  // pendingBot: the bot just pasted, so pairing goes to it rather than to the
+  // site's shared one.
+  notify: { status: null, alerts: null, pollTimer: null, pendingBot: null },
 };
 
 /* ------------------------------- utilities ------------------------------- */
@@ -22,15 +24,59 @@ const state = {
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) =>
   ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 
+/**
+ * Every call carries the session secret when we have one.
+ *
+ * It is attached unconditionally rather than per-endpoint: the public routes
+ * ignore it, and forgetting it on a guarded one is exactly the bug that makes a
+ * signed-in user look signed out. The server never echoes it back.
+ */
 async function api(path, opts = {}) {
+  const session = sessionToken.get();
   const res = await fetch(path, {
-    headers: opts.body ? { 'content-type': 'application/json' } : undefined,
     ...opts,
+    headers: {
+      ...(opts.body ? { 'content-type': 'application/json' } : {}),
+      ...(opts.headers || {}),
+      ...(session ? { 'x-notify-token': session } : {}),
+    },
     body: opts.body ? JSON.stringify(opts.body) : undefined,
   });
   const data = await res.json().catch(() => ({ error: `HTTP ${res.status}` }));
-  if (!res.ok) throw Object.assign(new Error(data.error || `HTTP ${res.status}`), { data, status: res.status });
+  if (!res.ok) {
+    // A guarded route reached without a session. Either the secret went stale
+    // (bot swapped, account removed) or this browser never had one — both mean
+    // "sign in", and stale secrets must be dropped or every later call repeats
+    // this same failure.
+    if (res.status === 401 && data.needsLogin) {
+      if (session) sessionToken.set(null);
+      state.meta = state.meta ? { ...state.meta, account: { signedIn: false } } : state.meta;
+    }
+    throw Object.assign(new Error(data.error || `HTTP ${res.status}`), { data, status: res.status });
+  }
   return data;
+}
+
+/** True once this browser holds a session secret. */
+const isSignedIn = () => Boolean(sessionToken.get());
+
+/**
+ * The prompt shown wherever a panel needs an account.
+ *
+ * Pairing Telegram IS the sign-in, so this always points at the same place
+ * rather than introducing a second credential to explain.
+ */
+function signInPrompt(what) {
+  return `
+    <div class="note warn">
+      <b>Sign in to use ${esc(what)}.</b>
+      <br>${esc(what)} ${what.endsWith('s') ? 'are' : 'is'} tied to your own account, so nobody
+      else can see or change ${what.endsWith('s') ? 'them' : 'it'}.
+      <br>Signing in is just connecting Telegram — no password, no email.
+      <div class="btn-row mt-10">
+        <button class="btn btn-sm" data-signin="1">Connect Telegram to sign in</button>
+      </div>
+    </div>`;
 }
 
 function toast(message, kind = '') {
@@ -338,7 +384,9 @@ function renderAnswer(r) {
   // On sale, but no live data (no token, or live lookup failed).
   const why = r.liveError
     ? esc(r.liveError.message)
-    : 'Add your Bangladesh Railway session token in Settings to see live seat counts and fares here.';
+    : (isSignedIn()
+      ? 'Add your Bangladesh Railway session token in Settings to see live seat counts and fares here.'
+      : 'Sign in with Telegram and add your own Bangladesh Railway session to see live seat counts and fares here. Schedules and sale times need no account.');
   return `
     <div class="answer is-open">
       <span class="answer-kicker">On sale now</span>
@@ -755,28 +803,20 @@ function closeDrawers() {
 
 /* --------------------------- sale-open alarms ---------------------------- */
 
+/**
+ * The whole login: one random secret, minted when a Telegram chat is paired.
+ *
+ * The key name is unchanged from when this only guarded alarms, so nobody who
+ * already paired gets signed out by this becoming a general account.
+ */
 const NOTIFY_KEY = 'br-notify-token';
-const notifyToken = {
+const sessionToken = {
   get: () => localStorage.getItem(NOTIFY_KEY) || null,
   set: (v) => (v ? localStorage.setItem(NOTIFY_KEY, v) : localStorage.removeItem(NOTIFY_KEY)),
 };
 
-/**
- * api() plus the bearer secret that identifies this browser's Telegram chat.
- * The content-type is restated here because api() drops its own default the
- * moment a caller supplies any headers of its own.
- */
-async function napi(path, opts = {}) {
-  const token = notifyToken.get();
-  return api(path, {
-    ...opts,
-    headers: {
-      ...(opts.body ? { 'content-type': 'application/json' } : {}),
-      ...(opts.headers || {}),
-      ...(token ? { 'x-notify-token': token } : {}),
-    },
-  });
-}
+/** api() already attaches the session; kept as the name the alarm code uses. */
+const napi = api;
 
 function updateAlarmBadge() {
   const n = state.notify.alerts?.active ?? 0;
@@ -793,13 +833,11 @@ function stopPairingPoll() {
 
 /** Load status + alerts. Silently tolerates a stale token from a wiped database. */
 async function refreshAlarms() {
-  const status = await api('/api/notify/status', {
-    headers: notifyToken.get() ? { 'x-notify-token': notifyToken.get() } : {},
-  });
+  const status = await api('/api/notify/status');
   state.notify.status = status;
 
   if (!status.connected) {
-    if (notifyToken.get()) notifyToken.set(null); // Token no longer recognised.
+    if (sessionToken.get()) sessionToken.set(null); // Secret no longer recognised.
     state.notify.alerts = null;
   } else {
     state.notify.alerts = await napi('/api/notify/alerts');
@@ -809,11 +847,18 @@ async function refreshAlarms() {
 }
 
 /**
- * The bot-token form. Shown on its own when nothing is connected, and folded
- * away behind a disclosure once it is, so the common case stays uncluttered.
+ * The bot panel.
+ *
+ * A bot belongs to whoever paired on it first, so there is no site-wide bot to
+ * describe any more and nothing here is shown to a stranger. It renders one of
+ * three things: the form on its own (you have no bot — pasting a token is how
+ * you sign up), your own bot with the option to replace or disconnect it, or a
+ * note that you are on this site's shared bot, which nobody may change here.
  */
 function botTokenForm(status, { collapsed = false } = {}) {
-  const tk = status.token || {};
+  const bot = status.bot || {};
+  const mine = isSignedIn() && bot.present;
+
   const form = `
     <div class="field mb-11">
       <label for="bot-token-input">Bot token from @BotFather</label>
@@ -822,24 +867,41 @@ function botTokenForm(status, { collapsed = false } = {}) {
     </div>
     <div class="btn-row">
       <button class="btn btn-sm" id="bot-token-save">Save &amp; verify</button>
-      ${tk.present && !tk.fromEnv ? '<button class="btn btn-ghost btn-sm" id="bot-token-clear">Disconnect bot</button>' : ''}
+      ${mine && bot.isOwner && !bot.isDefault
+        ? '<button class="btn btn-ghost btn-sm" id="bot-token-clear">Disconnect bot</button>'
+        : ''}
     </div>
     <p class="mt-11 fine">
       Verified with Telegram before it is stored, then kept in this project's own
       database and sent only to api.telegram.org. It never comes back to this page —
-      only the masked preview above. Anyone who can reach this server can change it,
-      so treat the server as trusted.
+      only the masked preview. Your bot is yours: nobody else signed in here can see
+      it, use it, or change it.
     </p>`;
 
-  if (!collapsed) return form;
+  const owned = mine && !bot.isDefault
+    ? `<p class="fine">Your bot: <b>@${esc(bot.username || '')}</b>
+        <code>${esc(bot.preview || '')}</code>${bot.savedAt
+          ? ` — connected ${esc(new Date(bot.savedAt).toLocaleString())}` : ''}${bot.isOwner
+          ? '' : '<br>Connected by whoever paired on it first, so only they can change it.'}</p>`
+    : '';
+
+  const shared = mine && bot.isDefault
+    ? `<div class="note">You are on this site's shared bot, which the deployment
+        configures — it is not yours to change. For a bot of your own, make one with
+        <a href="https://t.me/BotFather" target="_blank" rel="noopener">@BotFather</a> and paste
+        its token below. Connecting to it gives you a separate account here.</div>`
+    : '';
+
+  const inner = `${shared}${owned}${form}`;
+  if (!collapsed) return inner;
+
+  const summary = mine && !bot.isDefault
+    ? `Your bot${bot.username ? ` — @${esc(bot.username)}` : ''}`
+    : 'Use a Telegram bot of your own';
   return `
     <details class="bot-token-details">
-      <summary>Bot connection${tk.present ? ` — <code>${esc(tk.preview)}</code>` : ''}</summary>
-      <div class="mt-10">
-        ${tk.fromEnv ? '<div class="note">Currently loaded from the <code>TELEGRAM_BOT_TOKEN</code> environment variable. Saving one here overrides it.</div>' : ''}
-        ${tk.savedAt ? `<p class="fine">Saved ${esc(new Date(tk.savedAt).toLocaleString())}.</p>` : ''}
-        ${form}
-      </div>
+      <summary>${summary}</summary>
+      <div class="mt-10">${inner}</div>
     </details>`;
 }
 
@@ -852,10 +914,17 @@ async function saveBotToken(token) {
     if (res.webhookRemoved) {
       toast('A webhook was registered on that bot and has been removed — it would have blocked pairing.', '');
     }
-    if (res.swapped && res.strandedChats) {
-      toast(`${res.strandedChats} existing connection(s) belonged to the previous bot and must reconnect.`, 'err');
+    if (res.webhookBlocked) {
+      toast(`Saved, but its webhook could not be registered: ${res.webhookBlocked}.`, 'err');
     }
+    if (isSignedIn()) {
+      toast('Connecting to this bot gives you a separate account — your current alarms stay on the bot you are signed in with.', '');
+    }
+    // Pairing is what claims a bot, so go straight there: a bot nobody has
+    // paired on yet is still unclaimed, and the first chat to arrive owns it.
+    state.notify.pendingBot = res.botId;
     await renderAlarms();
+    if ($('#pair-slot')) startPairing();
   } catch (err) {
     toast(err.message, 'err');
     if (btn) { btn.disabled = false; btn.textContent = 'Save & verify'; }
@@ -875,32 +944,33 @@ async function renderAlarms() {
     return;
   }
 
-  if (!status.configured) {
-    body.innerHTML = `
-      <div class="note warn">
-        <b>No Telegram bot connected yet.</b>
-        ${status.error ? `<br>${esc(status.error)}` : ''}
-      </div>
-      <p>Alarms are delivered by a Telegram bot. Making one takes about a minute:</p>
-      <ol>
-        <li>Open <a href="https://t.me/BotFather" target="_blank" rel="noopener">@BotFather</a> in Telegram and send <code>/newbot</code>.</li>
-        <li>Give it any name and a username ending in <code>bot</code>.</li>
-        <li>Copy the token it replies with and paste it below.</li>
-      </ol>
-      ${botTokenForm(status)}`;
-    return;
-  }
-
   if (!status.connected) {
+    const shared = status.sharedBot;
     body.innerHTML = `
-      <h3>Connect Telegram</h3>
-      <p>Alarms ring in Telegram, so this browser needs to be linked to your chat once.
-      Nothing but your Telegram chat id and display name is stored.</p>
-      <div id="pair-slot">
-        <button class="btn" id="pair-start">Connect Telegram</button>
-      </div>
+      <h3>Sign in with Telegram</h3>
+      <p>Connecting a Telegram chat is the whole sign-in — no password, no email. It links this
+      browser to your own account, so your alarms, your railway session and your bot stay yours
+      and nobody else signed in here can see them. Nothing but your Telegram chat id and display
+      name is stored.</p>
+      ${shared ? `
+        <div id="pair-slot">
+          <button class="btn" id="pair-start">Connect Telegram</button>
+        </div>
+        <p class="mt-11 fine">Connects you to this site's shared bot,
+          <b>@${esc(shared.username || '')}</b>. You can bring your own instead — see below.</p>`
+      : `
+        <div class="note warn">
+          <b>This site has no shared bot</b>, so alarms are delivered by a bot you make and own.
+          It takes about a minute:
+        </div>
+        <ol>
+          <li>Open <a href="https://t.me/BotFather" target="_blank" rel="noopener">@BotFather</a> in Telegram and send <code>/newbot</code>.</li>
+          <li>Give it any name and a username ending in <code>bot</code>.</li>
+          <li>Copy the token it replies with and paste it below.</li>
+        </ol>
+        <div id="pair-slot"></div>`}
       <p class="mt-11 fine">You can set up to ${status.limit} alarms at a time.</p>
-      ${botTokenForm(status, { collapsed: true })}`;
+      ${botTokenForm(status, { collapsed: Boolean(shared) })}`;
     return;
   }
 
@@ -931,6 +1001,7 @@ async function renderAlarms() {
     ${inbound}
     <div class="note ok">
       <b>Connected to Telegram</b>${status.subscriber?.displayName ? ` — ${esc(status.subscriber.displayName)}` : ''}
+      ${status.botUsername ? `<br>via <b>@${esc(status.botUsername)}</b>${status.bot?.isDefault ? " (this site's shared bot)" : ''}` : ''}
       <br>${active} of ${limit} alarm${limit === 1 ? '' : 's'} in use.
     </div>
 
@@ -999,8 +1070,6 @@ async function renderAlarms() {
         <li><b>Action</b> → Media → <b>Play Sound / Vibrate</b>, choose an alarm tone, tick
           <b>Loop</b>, and set the stream to <b>Alarm</b> (alarm volume ignores silent mode).</li>
         <li><b>Action</b> → Volume → set <b>Alarm volume</b> to max, so it is loud regardless.</li>
-        <li>Add a second macro to stop it: trigger on a notification containing
-          <code>Alarm stopped</code>, or just add a home-screen “Stop” button.</li>
       </ol>
       Tasker (with AutoNotification) and Automate do the same thing if you prefer them.
     </div>
@@ -1011,6 +1080,42 @@ async function renderAlarms() {
       <code id="trigger-tag">${esc(status.triggerTag || '#RAILALARM')}</code>
       <button class="chip" id="copy-tag" type="button">Copy</button>
     </div>
+
+    <h3>Stopping the ringing</h3>
+    <p>Your phone started the sound, so your phone has to stop it — and the
+    <b>Stop alarm</b> button cannot be what does it, for a reason worth knowing:
+    tapping it means you are <i>looking at the chat</i>, and Telegram posts no
+    notification for the chat currently on screen. There is nothing for a macro
+    to see. Build the stop macro on one of these instead.</p>
+
+    <div class="note ok">
+      <b>Best — the notification going away is the signal.</b> Add a second macro:
+      <ol class="mt-10">
+        <li><b>Trigger</b> → Device Events → <b>Notification Removed</b> (some versions call it
+          <i>Notification Cleared</i>) → application <b>Telegram</b> → “Text content contains” →
+          <code>${esc(status.triggerTag || '#RAILALARM')}</code>.</li>
+        <li><b>Action</b> → Media → <b>Stop Sound / Vibrate</b>.</li>
+      </ol>
+      Opening the chat or swiping the alarm away clears that notification, which fires this
+      macro — so the sound stops the moment you actually deal with the alarm.
+    </div>
+
+    <div class="note">
+      <b>Also add a manual stop, so you are never trapped by a macro that did not fire.</b>
+      MacroDroid → <b>Quick Settings tile</b> or a home-screen widget, action
+      <b>Stop Sound / Vibrate</b>. This is the one that always works.
+    </div>
+
+    <p class="mt-11">And if you tap <b>Stop alarm</b> from <b>another</b> device — Telegram
+    Desktop, a tablet, a second phone — the ringing handset does get a silent message. That case
+    <i>can</i> be automated, on this tag:</p>
+    <div class="snippet-row">
+      <code id="stop-tag">${esc(status.stopTag || '#RAILSTOP')}</code>
+      <button class="chip" id="copy-stop-tag" type="button">Copy</button>
+    </div>
+    <p class="fine">Same macro shape as the start one — <b>Notification Received</b> →
+    Telegram → text contains this → <b>Stop Sound / Vibrate</b>. It is a bonus, not the
+    primary stop: it cannot fire when the chat you tapped in is the one on screen.</p>
     <p class="fine">Press <b>Send a test alarm</b> above once the macro is set up — the drill
     carries the same tag, so it is a genuine end-to-end test of the whole chain.</p>
 
@@ -1036,7 +1141,12 @@ async function startPairing() {
   slot.innerHTML = '<div class="skeleton sk-120"></div>';
   let pairing;
   try {
-    pairing = await api('/api/notify/pair', { method: 'POST', body: {} });
+    pairing = await api('/api/notify/pair', {
+      method: 'POST',
+      // A code is minted for one bot. Naming the one just pasted is what sends
+      // the user to their own bot rather than to the site's shared one.
+      body: { bot: state.notify.pendingBot || null },
+    });
   } catch (err) {
     slot.innerHTML = `<div class="note danger">${esc(err.message)}</div>`;
     return;
@@ -1070,7 +1180,8 @@ async function startPairing() {
 
     if (res.claimed) {
       stopPairingPoll();
-      notifyToken.set(res.subscriber.accessToken);
+      state.notify.pendingBot = null;
+      sessionToken.set(res.subscriber.accessToken);
       toast('Telegram connected — you can set alarms now.', 'good');
       renderAlarms();
     } else if (res.expired) {
@@ -1148,10 +1259,20 @@ async function renderSettings() {
   const [meta, watch] = await Promise.all([api('/api/meta'), api('/api/watchlist')]);
   state.meta = meta;
   const tk = meta.token;
+  const signedIn = Boolean(meta.account?.signedIn);
 
   body.innerHTML = `
+    ${signedIn
+      ? `<div class="note ok"><b>Signed in${meta.account.displayName ? ` as ${esc(meta.account.displayName)}` : ''}.</b>
+           Your railway session and your alarms are visible only to you.
+           <div class="btn-row mt-10"><button class="btn btn-ghost btn-sm" data-signout="1">Sign out of this browser</button></div>
+         </div>`
+      : ''}
+
     <h3>Live seat counts</h3>
-    ${tk.present
+    ${!signedIn
+      ? signInPrompt('a Bangladesh Railway session')
+      : tk.present
       ? `<div class="note ${tk.expired ? 'danger' : 'ok'}">
            <b>${tk.expired ? 'Token expired' : 'Token active'}</b> — ${esc(tk.preview)}
            ${tk.subject ? `<br>Account: ${esc(tk.subject)}` : ''}
@@ -1160,10 +1281,12 @@ async function renderSettings() {
            ${tk.fromEnv ? '<br>Loaded from the BR_TOKEN environment variable.' : ''}
          </div>`
       : `<div class="note warn"><b>No token yet.</b> Schedules and sale-open times work without one.
-           Seat counts, fares and the availability archive need a signed-in session.</div>`}
+           Seat counts, fares and the availability archive need a railway session.</div>`}
 
+    ${!signedIn ? '' : `
     <p>Bangladesh Railway protects its login with a Cloudflare challenge, so this site
-    cannot log in for you. Instead it reuses <em>your own</em> browser session.</p>
+    cannot log in for you. Instead it reuses <em>your own</em> browser session. It is stored
+    against your account alone — no other visitor can see it, use it or replace it.</p>
 
     <div class="note">
       <b>The token alone is not enough.</b> Every request the official site makes also carries
@@ -1194,9 +1317,9 @@ async function renderSettings() {
     </div>
     <p class="mt-11 fine">
       A bare token still works if a device id was captured previously. Both are stored only in
-      this project's own database and sent only back to railway.gov.bd. The session expires on
-      its own — re-run the snippet when it does.
-    </p>
+      this project's own database, on your own account row, and sent only back to
+      railway.gov.bd. The session expires on its own — re-run the snippet when it does.
+    </p>`}
 
     <h3>Timetable catalog</h3>
     <dl class="kv">
@@ -1211,7 +1334,8 @@ async function renderSettings() {
     </button>
 
     <h3>Tracked routes</h3>
-    <p>Tracked routes are swept hourly so their availability history builds up over time.</p>
+    <p>Tracked routes are swept hourly so their availability history builds up over time.
+    The list and the history it produces are shared by everyone; changing it needs an account.</p>
     ${watch.watches.length
       ? watch.watches.map((w) => `
           <div class="watch-item">
@@ -1221,7 +1345,9 @@ async function renderSettings() {
             <button class="chip" data-unwatch="${esc(w.fromCity)}|${esc(w.toCity)}">Remove</button>
           </div>`).join('')
       : '<div class="note">No routes tracked yet. Search a route, then use “Track this route’s availability”.</div>'}
-    <button class="btn btn-ghost btn-sm mt-9" id="collect-btn">Sweep tracked routes now</button>
+    ${signedIn
+      ? '<button class="btn btn-ghost btn-sm mt-9" id="collect-btn">Sweep tracked routes now</button>'
+      : '<p class="fine mt-9">Sign in to change tracked routes or sweep them now.</p>'}
   `;
 
   $('#token-save')?.addEventListener('click', async () => {
@@ -1461,8 +1587,25 @@ function wireEvents() {
       return;
     }
     if (t.closest('#bot-token-clear')) {
-      await api('/api/notify/bot', { method: 'DELETE' }).catch((e) => toast(e.message, 'err'));
-      toast('Bot disconnected. Pending alarms are kept and will ring once a bot is connected again.', '');
+      // Genuinely destructive: an account IS a chat on a bot, so removing the
+      // bot removes every account paired through it — the caller's included.
+      const bot = state.notify.status?.bot || {};
+      const ok = confirm(
+        `Disconnect @${bot.username || 'this bot'}?\n\n`
+        + 'This removes the bot and every account connected through it, including yours, '
+        + 'along with their alarms. It cannot be undone.',
+      );
+      if (!ok) return;
+      try {
+        const res = await api('/api/notify/bot', { method: 'DELETE' });
+        sessionToken.set(null); // Your account went with the bot.
+        toast(
+          `Bot disconnected — ${res.removedSubscribers} account(s) and their alarms were removed.`,
+          '',
+        );
+      } catch (e) {
+        toast(e.message, 'err');
+      }
       renderAlarms();
       return;
     }
@@ -1470,8 +1613,9 @@ function wireEvents() {
     const cancelAlarmBtn = t.closest('[data-cancel-alarm]');
     if (cancelAlarmBtn) { cancelAlarm(Number(cancelAlarmBtn.dataset.cancelAlarm)); return; }
 
-    if (t.closest('#copy-tag')) {
-      const tag = $('#trigger-tag')?.textContent.trim();
+    if (t.closest('#copy-tag') || t.closest('#copy-stop-tag')) {
+      const id = t.closest('#copy-stop-tag') ? '#stop-tag' : '#trigger-tag';
+      const tag = $(id)?.textContent.trim();
       try { await navigator.clipboard.writeText(tag); toast('Tag copied.', 'good'); }
       catch { toast(`Match on: ${tag}`, ''); }
       return;
@@ -1505,6 +1649,21 @@ function wireEvents() {
     if (t.closest('[data-ics]')) { downloadReminder(); return; }
     if (t.closest('[data-refresh]')) { doSearch(); return; }
     if (t.closest('[data-open-settings]')) { renderSettings(); return; }
+
+    // Signing in is pairing Telegram, so both buttons lead to the same panel.
+    if (t.closest('[data-signin]')) { closeDrawers(); renderAlarms(); return; }
+
+    if (t.closest('[data-signout]')) {
+      // Local only: it forgets the secret in this browser and leaves the
+      // account, its alarms and its railway session untouched on the server.
+      sessionToken.set(null);
+      state.notify.status = null;
+      state.notify.alerts = null;
+      updateAlarmBadge();
+      toast('Signed out of this browser. Your alarms are still set.');
+      renderSettings();
+      return;
+    }
 
     if (t.closest('[data-watch]')) {
       const q = currentQuery();

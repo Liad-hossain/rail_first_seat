@@ -8,14 +8,17 @@
  *
  *   0 8,14,20 * * *  cd /path/to/rail_first_seat && /usr/local/bin/node scripts/run-snapshot.js
  */
-import { migrate, getMeta, closePool } from '../src/db.js';
+import { migrate, closePool } from '../src/db.js';
 import { collectOnce, listWatches } from '../src/history.js';
+import { serviceCredentials } from '../src/session.js';
 
 await migrate();
 
-const token = (await getMeta('br_token')) || process.env.BR_TOKEN || null;
-if (!token) {
-  console.error('No session token. Add one in the website Settings panel, or set BR_TOKEN.');
+// Sessions belong to individual users now; this runs on the deployment's
+// designated background credentials — BR_TOKEN, else the newest saved session.
+const creds = await serviceCredentials();
+if (!creds.token) {
+  console.error('No session token. Sign in on the website and add one in Settings, or set BR_TOKEN.');
   await closePool();
   process.exit(1);
 }
@@ -28,7 +31,7 @@ if (!watches.length) {
 }
 
 console.log(`Sweeping ${watches.length} route(s): ${watches.map((w) => `${w.fromLabel}>${w.toLabel}`).join(', ')}`);
-const res = await collectOnce({ token, log: console.log });
+const res = await collectOnce({ token: creds, log: console.log });
 console.log(JSON.stringify(res));
 await closePool();
 if (res.authFailed) process.exit(2);

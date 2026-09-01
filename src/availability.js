@@ -22,7 +22,7 @@ import {
 } from './config.js';
 import { getMeta } from './db.js';
 import { findTrainsForRoute, stationLabel } from './catalog.js';
-import { searchTrips, bookingUrl, UpstreamError } from './shohoz.js';
+import { searchTrips, bookingUrl, UpstreamError, hasToken } from './shohoz.js';
 import {
   addDays, daysBetween, dhakaToUTC, humanDuration, prettyDate,
   todayISO, weekdayShort, minutesOfDay, timeFromText,
@@ -251,7 +251,7 @@ export async function fullAvailability({ fromCity, toCity, dateISO, token, now =
 
   let live = null;
   let liveError = null;
-  const worthQuerying = token && plan.dateStatus.kind === 'bookable';
+  const worthQuerying = hasToken(token) && plan.dateStatus.kind === 'bookable';
 
   if (worthQuerying) {
     try {
@@ -291,7 +291,7 @@ export async function fullAvailability({ fromCity, toCity, dateISO, token, now =
       : null,
     liveError,
     liveChecked: Boolean(live),
-    tokenPresent: Boolean(token),
+    tokenPresent: hasToken(token),
   };
 }
 
@@ -320,7 +320,7 @@ export async function earliestBookable({ fromCity, toCity, token, now = new Date
       error: null,
     };
 
-    if (plan.trainsRunningOnDate > 0 && token) {
+    if (plan.trainsRunningOnDate > 0 && hasToken(token)) {
       try {
         const live = await liveAvailability({ fromCity, toCity, dateISO, token });
         const filtered = seatClass
@@ -345,5 +345,5 @@ export async function earliestBookable({ fromCity, toCity, token, now = new Date
     days.push(entry);
   }
 
-  return { days, earliest, needsAuth: false, tokenPresent: Boolean(token), seatClass };
+  return { days, earliest, needsAuth: false, tokenPresent: hasToken(token), seatClass };
 }
