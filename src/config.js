@@ -20,24 +20,10 @@ if (fs.existsSync(path.join(ROOT, '.env'))) {
 export const PORT = Number(process.env.PORT || 8787);
 export const NODE_ENV = process.env.NODE_ENV || 'development';
 
-/**
- * True inside a Netlify/Lambda function. Two things must change there: the
- * Postgres pool shrinks to one connection (every container opens its own, and
- * a pooler has a hard cap), and work that outlives a function invocation —
- * the ~1 minute catalog crawl — has to be refused with an explanation rather
- * than started and silently killed.
- */
+
 export const SERVERLESS =
   process.env.NETLIFY === 'true' || Boolean(process.env.AWS_LAMBDA_FUNCTION_NAME);
 
-/* ------------------------------------------------------------------ *
- * Database — Supabase Postgres
- *
- * The connection string is a SECRET. It is read from the environment only:
- * never hard-coded, never written to a committed file, and never sent to the
- * browser. The frontend talks exclusively to this server's own /api routes, so
- * no database credential ever reaches a visitor.
- * ------------------------------------------------------------------ */
 
 export const DATABASE_URL =
   process.env.SUPABASE_DB_URL ||
@@ -137,6 +123,12 @@ export const SALE_OPEN_TIME = process.env.BR_SALE_OPEN_TIME || '08:00:00';
 /** meta keys holding the measured release time and the evidence behind it. */
 export const SALE_OPEN_TIME_KEY = 'observed_sale_open_time';
 export const SALE_OPEN_EVIDENCE_KEY = 'observed_sale_open_evidence';
+/**
+ * The open half of a bracket: the most recent sighting of "this date is still
+ * closed". Kept apart from the evidence key so a half-finished observation can
+ * never be read as a finished measurement.
+ */
+export const SALE_OPEN_PENDING_KEY = 'observed_sale_open_pending';
 
 /**
  * How often the probe re-checks the newest journey date while it is waiting
@@ -145,6 +137,19 @@ export const SALE_OPEN_EVIDENCE_KEY = 'observed_sale_open_evidence';
 export const PROBE_INTERVAL_MS = 60_000;
 export const PROBE_FROM_HOUR = 0;
 export const PROBE_TO_HOUR = 16;
+
+/**
+ * How stale the "still no seats" sighting may be for the next sighting to
+ * count as a measurement.
+ *
+ * A release time is only ever measured as an interval: seats were absent at
+ * A and present at B, so the release is in (A, B]. Without an A there is no
+ * measurement at all — only the time somebody first happened to look, which is
+ * exactly how a real deployment recorded 09:48 for a sale that opens at 08:00.
+ * Generous next to the 60s probe interval so a couple of missed ticks still
+ * yield a usable answer, tight enough that the minute is not in doubt.
+ */
+export const PROBE_MAX_BRACKET_MS = 5 * 60_000;
 
 /**
  * The operator's published counter opening time, carried per-train by

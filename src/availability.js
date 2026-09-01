@@ -1,24 +1,6 @@
-/**
- * The "first availability" engine.
- *
- * "First availability" has three distinct meanings, and this site answers all
- * three because the useful answer depends on where you are in the cycle:
- *
- *  A. WHEN CAN I FIRST BUY a ticket for journey date D?
- *     Bangladesh Railway sells a rolling window of today .. today+10, so D
- *     opens the instant (D - ADVANCE_DAYS) begins in Dhaka — 00:00 BST, when
- *     the window rolls forward. This is deterministic and needs no login — it
- *     is the question the official site simply refuses to answer, because a
- *     date more than 10 days out is not even selectable in its datepicker.
- *
- *  B. Given D is already on sale, WHICH TRAIN still has seats, in what class,
- *     at what fare? Needs a session token (live seat counts).
- *
- *  C. What is the EARLIEST DATE from now on which this route actually has a
- *     seat I can buy? Scans the bookable window. Needs a session token.
- */
 import {
-  ADVANCE_DAYS, SALE_OPEN_TIME, SALE_OPEN_TIME_KEY, ZONE_OPENING_TIME, SEAT_CLASS_LABELS,
+  ADVANCE_DAYS, SALE_OPEN_TIME, SALE_OPEN_TIME_KEY, SALE_OPEN_EVIDENCE_KEY,
+  PROBE_MAX_BRACKET_MS, ZONE_OPENING_TIME, SEAT_CLASS_LABELS,
 } from './config.js';
 import { getMeta } from './db.js';
 import { findTrainsForRoute, stationLabel } from './catalog.js';
@@ -35,9 +17,35 @@ export function bookingWindow(now = new Date()) {
 }
 
 /**
- * The release time actually in force: measured if we have ever seen it,
- * otherwise the documented default. Cached briefly because routePlan() calls
- * this on every request and the value changes at most once a day.
+ * Does the stored measurement actually rest on a bracket?
+ *
+ * A release time is only ever measured as an interval: this date was closed at
+ * A, open at B, so the release is in (A, B]. A bare "there were seats when I
+ * looked" dates the observer, not the release.
+ *
+ * Checked HERE, at the point of use, and not only where the measurement is
+ * written — because the value lives in a shared database that another process
+ * can write. An older build of this app, still deployed and pointed at the same
+ * Postgres, will happily keep recording first-sightings; refusing them on read
+ * is what stops one stale writer putting every alarm on the wrong minute.
+ */
+export function isBracketedMeasurement(evidence) {
+  if (!evidence?.absentAt || !evidence?.seenAt) return false;
+  const width = Number(evidence.resolutionMs);
+  return Number.isFinite(width) && width >= 0 && width <= PROBE_MAX_BRACKET_MS;
+}
+
+async function measurementIsBracketed() {
+  const raw = await getMeta(SALE_OPEN_EVIDENCE_KEY);
+  if (!raw) return false;
+  try { return isBracketedMeasurement(JSON.parse(raw)); } catch { return false; }
+}
+
+/**
+ * The release time actually in force: measured if we have ever properly
+ * measured it, otherwise the documented default. Cached briefly because
+ * routePlan() calls this on every request and the value changes at most once a
+ * day.
  */
 let saleTimeCache = { value: null, at: 0 };
 
@@ -47,7 +55,10 @@ export async function effectiveSaleOpenTime() {
   let source = 'default';
   try {
     const observed = await getMeta(SALE_OPEN_TIME_KEY);
-    if (observed && /^\d{2}:\d{2}:\d{2}$/.test(observed)) { value = observed; source = 'measured'; }
+    if (observed && /^\d{2}:\d{2}:\d{2}$/.test(observed) && await measurementIsBracketed()) {
+      value = observed;
+      source = 'measured';
+    }
   } catch { /* database not reachable — the default is still correct enough */ }
   saleTimeCache = { value, at: Date.now(), source };
   return value;
@@ -101,9 +112,7 @@ function runsOn(train, journeyDateISO) {
   return { runs: train.runningDays.includes(wd), certain: true, weekday: wd };
 }
 
-/**
- * The offline answer for a route + date. Always available, never needs a login.
- */
+
 export async function routePlan({ fromCity, toCity, dateISO, now = new Date() }) {
   const window = bookingWindow(now);
   const dateStatus = classifyDate(dateISO, now);
@@ -138,9 +147,6 @@ export async function routePlan({ fromCity, toCity, dateISO, now = new Date() })
 
   const running = trains.filter((t) => t.runsOnDate);
 
-  // Requirement A: the earliest moment any ticket for this date can be bought.
-  // The window rolls forward for the whole network at once, so every train
-  // running that day shares one instant — no per-train minimum to take.
   let firstAvailability = null;
   if (running.length) {
     const sale = running[0].sale;
@@ -184,10 +190,6 @@ const num = (v) => {
   return Number.isFinite(n) ? n : 0;
 };
 
-/**
- * search-trips-v2 has shifted field names between releases, so read tolerantly
- * and keep the raw payload out of the response.
- */
 function parseSeatType(st) {
   const counts = st?.seat_counts || st?.seatCounts || {};
   const online = num(counts.online ?? st.online_seats ?? st.available_seats);
@@ -241,11 +243,7 @@ export async function liveAvailability({ fromCity, toCity, dateISO, token }) {
   };
 }
 
-/**
- * Merge the offline plan with live seat data where a token is available.
- * The offline plan is always the backbone, so a missing or expired token
- * degrades the page rather than breaking it.
- */
+
 export async function fullAvailability({ fromCity, toCity, dateISO, token, now = new Date() }) {
   const plan = await routePlan({ fromCity, toCity, dateISO, now });
 
@@ -295,10 +293,7 @@ export async function fullAvailability({ fromCity, toCity, dateISO, token, now =
   };
 }
 
-/**
- * Requirement C: scan the bookable window and report the earliest date that
- * actually has a buyable seat, plus a per-day strip for the whole window.
- */
+
 export async function earliestBookable({ fromCity, toCity, token, now = new Date(), seatClass = null }) {
   const { firstDate, lastDate } = bookingWindow(now);
   const dates = [];

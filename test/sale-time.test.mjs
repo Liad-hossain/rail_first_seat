@@ -20,7 +20,24 @@ import crypto from 'node:crypto';
 
 const SRC = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'src');
 
+
 let liveSeats = 0;
+const realShohoz = await import(path.join(SRC, 'shohoz.js'));
+mock.module(path.join(SRC, 'shohoz.js'), {
+  namedExports: {
+    ...realShohoz,
+    searchTrips: async () => ({
+      trains: liveSeats > 0
+        ? [{
+            trip_number: 'TEST-1', train_model: '709',
+            departure_date_time: '2026-01-01T08:00:00', arrival_date_time: '2026-01-01T12:00:00',
+            seat_types: [{ type: 'S_CHAIR', seat_counts: { online: liveSeats, offline: 0 }, fare: '100', vat_amount: '0' }],
+          }]
+        : [],
+    }),
+  },
+});
+
 mock.module(path.join(SRC, 'telegram.js'), {
   namedExports: {
     botConfigured: async () => true,
@@ -43,8 +60,10 @@ const { migrate, query, one, getMeta, setMeta, closePool } = await import(path.j
 const { addDays, todayISO, dhakaToUTC } = await import(path.join(SRC, 'time.js'));
 const availability = await import(path.join(SRC, 'availability.js'));
 const notify = await import(path.join(SRC, 'notify.js'));
+const history = await import(path.join(SRC, 'history.js'));
 const {
   ADVANCE_DAYS, SALE_OPEN_TIME, SALE_OPEN_TIME_KEY, SALE_OPEN_EVIDENCE_KEY,
+  SALE_OPEN_PENDING_KEY,
 } = await import(path.join(SRC, 'config.js'));
 
 await migrate();
@@ -59,10 +78,12 @@ const subscriber = await one(
 // Preserve any real measurement so a test run cannot destroy it.
 const savedTime = await getMeta(SALE_OPEN_TIME_KEY);
 const savedEvidence = await getMeta(SALE_OPEN_EVIDENCE_KEY);
+const savedPending = await getMeta(SALE_OPEN_PENDING_KEY);
 
 after(async () => {
   await setMeta(SALE_OPEN_TIME_KEY, savedTime || '');
   await setMeta(SALE_OPEN_EVIDENCE_KEY, savedEvidence || '');
+  await setMeta(SALE_OPEN_PENDING_KEY, savedPending || '');
   await query('DELETE FROM notify_subscribers WHERE chat_id = $1', [chatId]);
   await closePool();
 });
@@ -72,6 +93,8 @@ beforeEach(async () => {
     [subscriber.id]);
   await setMeta(SALE_OPEN_TIME_KEY, '');
   await setMeta(SALE_OPEN_EVIDENCE_KEY, '');
+  await setMeta(SALE_OPEN_PENDING_KEY, '');
+  liveSeats = 0;
   availability.__resetSaleTimeCache?.();
 });
 
@@ -98,8 +121,25 @@ test('a plan opens on D-10 at the release time, not at midnight', async () => {
   assert.equal(fa.openTimeSource, 'default');
 });
 
+/** A properly bracketed measurement, as probeSaleRelease() would leave it. */
+async function storeMeasurement(time, { widthMs = 45_000 } = {}) {
+  const seenAt = new Date();
+  await setMeta(SALE_OPEN_TIME_KEY, time);
+  await setMeta(SALE_OPEN_EVIDENCE_KEY, JSON.stringify({
+    observedOn: todayISO(),
+    journeyDate: addDays(todayISO(), ADVANCE_DAYS),
+    route: 'Dhaka > Sreemangal',
+    absentAt: new Date(seenAt.getTime() - widthMs).toISOString(),
+    absentAtDhaka: '07:59:15',
+    seenAt: seenAt.toISOString(),
+    seenAtDhaka: time,
+    onlineSeats: 5,
+    resolutionMs: widthMs,
+  }));
+}
+
 test('a measured time overrides the default', async () => {
-  await setMeta(SALE_OPEN_TIME_KEY, '09:30:00');
+  await storeMeasurement('09:30:00');
   availability.__resetSaleTimeCache?.();
 
   const t = await availability.effectiveSaleOpenTime();
@@ -113,9 +153,36 @@ test('a measured time overrides the default', async () => {
 });
 
 test('a malformed measurement is ignored rather than trusted', async () => {
-  await setMeta(SALE_OPEN_TIME_KEY, 'not-a-time');
+  await storeMeasurement('not-a-time');
   availability.__resetSaleTimeCache?.();
   assert.equal(await availability.effectiveSaleOpenTime(), SALE_OPEN_TIME);
+});
+
+test('a time with no bracket behind it is refused on READ, not just on write', async () => {
+  // Exactly what an older build of this app, still deployed against the same
+  // database, keeps writing: a first sighting with no "still closed" end.
+  await setMeta(SALE_OPEN_TIME_KEY, '09:48:00');
+  await setMeta(SALE_OPEN_EVIDENCE_KEY, JSON.stringify({
+    observedOn: todayISO(),
+    journeyDate: addDays(todayISO(), ADVANCE_DAYS),
+    route: 'Dhaka > Sreemangal',
+    seenAt: new Date().toISOString(),
+    seenAtDhaka: '09:48:08',
+    onlineSeats: 10,
+    resolutionMs: 60_000,
+  }));
+  availability.__resetSaleTimeCache?.();
+
+  assert.equal(await availability.effectiveSaleOpenTime(), SALE_OPEN_TIME,
+    'the documented default wins over an unbracketed value');
+  assert.equal(availability.saleOpenTimeSource(), 'default');
+});
+
+test('a bracket too wide to name a minute is refused on read as well', async () => {
+  await storeMeasurement('09:48:00', { widthMs: 3 * 60 * 60 * 1000 });
+  availability.__resetSaleTimeCache?.();
+  assert.equal(await availability.effectiveSaleOpenTime(), SALE_OPEN_TIME);
+  assert.equal(availability.saleOpenTimeSource(), 'default');
 });
 
 test('alarms already scheduled are re-timed when the release time moves', async () => {
@@ -125,8 +192,10 @@ test('alarms already scheduled are re-timed when the release time moves', async 
   });
   assert.equal(dhakaClock(alert.opensAt), SALE_OPEN_TIME.slice(0, 5));
 
-  // A measurement lands: every pending alarm must follow it.
-  await setMeta(SALE_OPEN_TIME_KEY, '07:45:00');
+  // A measurement lands: every pending alarm must follow it. It has to be a
+  // real, bracketed one — an unbracketed value is no longer a measurement and
+  // would correctly move nothing.
+  await storeMeasurement('07:45:00');
   availability.__resetSaleTimeCache?.();
   const res = await notify.resyncAlertOpenTimes();
   assert.ok(res.moved >= 1, 'at least this alarm moved');
@@ -152,4 +221,64 @@ test('re-timing is idempotent', async () => {
   assert.ok(second.checked >= 1);
   await notify.cancelAlert(subscriber.id, alert.id);
   void first;
+});
+
+
+const probeToken = { token: 'test-token', deviceId: 'd', deviceKey: 'k' };
+
+test('seats already on sale at the first look are NOT a measurement', async () => {
+  // No "still closed" sighting has ever been recorded — exactly the state a
+  // freshly pasted session token leaves behind.
+  liveSeats = 10;
+  const res = await history.probeSaleRelease({ token: probeToken });
+
+  assert.equal(res.measured, null, 'nothing measured');
+  assert.equal(res.inconclusive, 'no absent sighting today');
+  assert.equal(await getMeta(SALE_OPEN_TIME_KEY), '',
+    'and crucially the release time is left alone, not overwritten');
+
+  availability.__resetSaleTimeCache?.();
+  assert.equal(await availability.effectiveSaleOpenTime(), SALE_OPEN_TIME,
+    'so the documented default still governs every route');
+  assert.equal(availability.saleOpenTimeSource(), 'default',
+    'and the UI is told it is a default, not a measurement');
+});
+
+test('closed then open IS a measurement, and records both ends', async () => {
+  liveSeats = 0;
+  const absent = await history.probeSaleRelease({ token: probeToken });
+  assert.equal(absent.seatsYet, false, 'the closed sighting is recorded');
+
+  liveSeats = 7;
+  const res = await history.probeSaleRelease({ token: probeToken });
+
+  assert.ok(res.measured, `a measurement was taken (got ${JSON.stringify(res)})`);
+  assert.match(res.measured, /^\d{2}:\d{2}:00$/);
+  assert.ok(res.observed.absentAt, 'the closed end is kept');
+  assert.ok(res.observed.seenAt, 'and the open end');
+  assert.ok(res.observed.resolutionMs < 60_000,
+    'precision is the real bracket width, not an assumed probe interval');
+  assert.equal(await getMeta(SALE_OPEN_TIME_KEY), res.measured);
+
+  const { evidence, inconclusive } = await history.saleReleaseEvidence();
+  assert.ok(evidence, 'the UI gets real evidence');
+  assert.equal(inconclusive, null);
+});
+
+test('a stale closed sighting is too weak to name a minute', async () => {
+  // Seen closed, but hours ago — the sale could have opened at any point since.
+  await setMeta(SALE_OPEN_PENDING_KEY, JSON.stringify({
+    observedOn: new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Dhaka' }).format(new Date()),
+    journeyDate: addDays(todayISO(), ADVANCE_DAYS),
+    route: 'Dhaka > Sreemangal',
+    absentAt: new Date(Date.now() - 3 * 60 * 60 * 1000).toISOString(),
+    absentAtDhaka: '06:00:00',
+  }));
+
+  liveSeats = 3;
+  const res = await history.probeSaleRelease({ token: probeToken });
+
+  assert.equal(res.measured, null, 'refused');
+  assert.equal(res.inconclusive, 'bracket too wide');
+  assert.equal(await getMeta(SALE_OPEN_TIME_KEY), '', 'release time untouched');
 });

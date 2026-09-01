@@ -1,23 +1,3 @@
-/**
- * The bot registry.
- *
- * A Telegram bot used to be a single site-wide token in `meta`. That made the
- * bot a shared fixture rather than anyone's property: every visitor paired with
- * whichever bot happened to be installed, its @username and masked token were
- * readable without signing in, and any signed-in account could swap or
- * disconnect it out from under everybody else.
- *
- * Here a bot is a row you own. You bring your own token from @BotFather; the
- * first chat that pairs on it claims it; after that only the owner may replace
- * or disconnect it. `TELEGRAM_BOT_TOKEN`, if the deployment sets one, seeds a
- * single *default* bot — the one a visitor with no bot of their own can still
- * pair with, and the migration path for a deployment that had exactly one bot
- * before any of this existed.
- *
- * This module is the registry and nothing else: rows, ownership, and verifying
- * a pasted token against getMe. Webhook registration and the update loop stay
- * in notify.js, which is where delivery lives.
- */
 import { TELEGRAM_BOT_TOKEN } from './config.js';
 import { query, one } from './db.js';
 import { getBot } from './telegram.js';
@@ -34,10 +14,6 @@ const COLUMNS = `id, bot_id, token, username, name, owner_id, created_at,
                  token_saved_at, update_offset, delivery_mode, webhook_url,
                  webhook_secret_fp, is_default`;
 
-/**
- * Rows are handed around in snake_case exactly as Postgres returns them —
- * every consumer here is server-side. `describeBot` is what the browser gets.
- */
 export async function listBots() {
   return query(`SELECT ${COLUMNS} FROM bots ORDER BY id`);
 }
@@ -53,13 +29,7 @@ export async function botByBotId(botId) {
   return one(`SELECT ${COLUMNS} FROM bots WHERE bot_id = $1`, [String(botId)]);
 }
 
-/**
- * The bot a visitor with no account of their own may pair with.
- *
- * Only ever the deployment's own TELEGRAM_BOT_TOKEN bot. Deliberately not
- * "whichever bot exists": falling back to some other user's bot is precisely
- * the shared-fixture behaviour this replaced.
- */
+
 export async function defaultBot() {
   return one(`SELECT ${COLUMNS} FROM bots WHERE is_default LIMIT 1`);
 }
@@ -84,14 +54,7 @@ export async function anyBotConfigured() {
   return (await countBots()) > 0;
 }
 
-/**
- * Store a verified bot.
- *
- * getMe is called before anything is written, so a typo is caught at the
- * moment of pasting rather than silently at 3am when an alarm fires. Re-saving
- * a bot that already exists refreshes its token (BotFather can reissue one) and
- * its identity, and leaves ownership alone — the caller checks that first.
- */
+
 export async function upsertBot(token, { isDefault = false } = {}) {
   const trimmed = String(token || '').trim();
   const botId = botIdOf(trimmed);
@@ -126,11 +89,7 @@ export async function claimBot(botRowId, subscriberId) {
   );
 }
 
-/**
- * Deleting a bot really does end the accounts on it — an alarm with no bot to
- * ring through can never fire — so the count goes back to the caller for the
- * confirmation the UI shows.
- */
+
 export async function deleteBot(botRowId) {
   const { n } = await one(
     'SELECT COUNT(*)::int AS n FROM notify_subscribers WHERE bot_id = $1',
@@ -160,13 +119,7 @@ export async function setBotWebhook(botRowId, { url, secretFp, mode }) {
   );
 }
 
-/**
- * Seed the deployment's own bot from the environment.
- *
- * Runs at boot and is idempotent. Without it a deployment that only ever set
- * TELEGRAM_BOT_TOKEN would have no bot at all after this change, and every
- * previously paired chat would be stranded.
- */
+
 export async function ensureDefaultBot({ log = () => {} } = {}) {
   if (!TELEGRAM_BOT_TOKEN) return null;
   const botId = botIdOf(TELEGRAM_BOT_TOKEN);
@@ -189,20 +142,12 @@ export async function ensureDefaultBot({ log = () => {} } = {}) {
     log(`telegram: default bot @${bot.username} available to visitors with no bot of their own`);
     return bot;
   } catch (err) {
-    // A bad env token must not stop the site booting; it only means there is
-    // no shared bot, which is a legitimate state.
     log(`telegram: could not verify TELEGRAM_BOT_TOKEN — ${err.message}`);
     return existing || null;
   }
 }
 
-/**
- * What the browser is allowed to know about a bot.
- *
- * Never the token. The bot id half is included because it is not secret and is
- * what the pairing call names, but the secret half is masked to four characters
- * exactly as before.
- */
+
 export function describeBot(bot, { viewerId = null } = {}) {
   if (!bot) return { present: false };
   return {

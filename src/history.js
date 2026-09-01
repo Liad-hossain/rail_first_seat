@@ -13,12 +13,13 @@
  *   - month-by-month coverage of what has been captured so far
  */
 import { query, one, transact, isoDate, isoTimestamp, getMeta, setMeta } from './db.js';
-import { liveAvailability, bookingWindow } from './availability.js';
+import { liveAvailability, bookingWindow, isBracketedMeasurement } from './availability.js';
 import { findTrainsForRoute, stationLabel } from './catalog.js';
 import { addDays, daysBetween, todayISO, prettyDate, weekdayShort, nowInDhaka } from './time.js';
 import {
   ADVANCE_DAYS, TZ, PROBE_INTERVAL_MS, PROBE_FROM_HOUR, PROBE_TO_HOUR,
-  SALE_OPEN_TIME_KEY, SALE_OPEN_EVIDENCE_KEY,
+  PROBE_MAX_BRACKET_MS,
+  SALE_OPEN_TIME_KEY, SALE_OPEN_EVIDENCE_KEY, SALE_OPEN_PENDING_KEY,
 } from './config.js';
 import { UpstreamError, hasToken } from './shohoz.js';
 
@@ -374,14 +375,29 @@ export function startCollector({ getToken, intervalMs = 60 * 60 * 1000, log = co
  * The exact time of day Bangladesh Railway releases seats is not published
  * anywhere and has moved before, so rather than hard-code a guess the app
  * measures it: on each day, watch the NEWEST journey date (today + 10, which
- * became selectable at midnight but has no seats yet) and record the first
- * moment seats appear. That timestamp then drives every alarm.
+ * became selectable at midnight but has no seats yet) and record when seats
+ * appear. That timestamp then drives every alarm.
+ *
+ * A sighting of seats is NOT by itself a measurement. The release is only ever
+ * bracketed: absent at A, present at B, therefore released in (A, B]. Without
+ * an A, "seats are there now" says nothing about when they arrived — it is the
+ * time the observer turned up, which may be hours late.
+ *
+ * That distinction is not theoretical. A deployment whose session token was
+ * first saved at 09:47 Dhaka probed five seconds later, found seats already on
+ * sale, and recorded 09:48 as the release time for the whole network — for a
+ * sale that opens at 08:00. Every alarm was then armed 108 minutes late, and
+ * the UI reported the wrong time as "measured, not assumed". So the absent
+ * sighting is now mandatory, and it must be recent.
  * ------------------------------------------------------------------ */
 
 /**
  * One observation. Cheap enough to call every minute: it does nothing outside
- * the watch hours, nothing once today's release has been seen, and nothing
+ * the watch hours, nothing once today's release has been measured, and nothing
  * without a session token.
+ *
+ * Two outcomes matter and both are recorded. Seeing NO seats is the useful
+ * half — it is what makes a later sighting a measurement rather than a guess.
  */
 export async function probeSaleRelease({ token, log = () => {} }) {
   if (!hasToken(token)) return { skipped: 'no token' };
@@ -408,40 +424,130 @@ export async function probeSaleRelease({ token, log = () => {} }) {
     return { skipped: `lookup failed: ${err.message}` };
   }
 
-  if (live.onlineSeats <= 0) return { seatsYet: false, dateISO };
-
-  // First sighting of the day. The true release is somewhere in the interval
-  // since the previous check, so record that interval honestly rather than
-  // pretending this instant is exact.
   const at = new Date();
+  const dhakaClock = (t) => new Intl.DateTimeFormat('en-GB', {
+    timeZone: TZ, hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false,
+  }).format(t);
+
+  // ---- The absent half of the bracket -------------------------------------
+  // Recorded every time, because the LAST of these before seats appear is what
+  // pins the release down. Kept in its own key so it can never be mistaken for
+  // a finished measurement.
+  if (live.onlineSeats <= 0) {
+    await setMeta(SALE_OPEN_PENDING_KEY, JSON.stringify({
+      observedOn: todayDhaka,
+      journeyDate: dateISO,
+      route: `${fromCity} > ${toCity}`,
+      absentAt: at.toISOString(),
+      absentAtDhaka: dhakaClock(at),
+    }));
+    return { seatsYet: false, dateISO, absentAt: at.toISOString() };
+  }
+
+  // ---- Seats are here. Is it a measurement, or just the first look? -------
+  const pendingRaw = await getMeta(SALE_OPEN_PENDING_KEY);
+  const pending = JSON.parse(pendingRaw || 'null');
+
+  // Yesterday's bracket says nothing about today's release.
+  const usable = pending?.observedOn === todayDhaka && pending?.journeyDate === dateISO
+    ? pending
+    : null;
+
+  if (!usable) {
+    // Seats were already on sale the first time we looked today. That is not a
+    // release time, it is an arrival time — refuse to record it, and say so
+    // once rather than every minute.
+    if (evidence?.inconclusiveOn !== todayDhaka) {
+      await setMeta(SALE_OPEN_EVIDENCE_KEY, JSON.stringify({
+        ...(evidence || {}),
+        inconclusiveOn: todayDhaka,
+        inconclusiveReason: 'seats were already on sale at the first look today',
+        firstLookDhaka: dhakaClock(at),
+      }));
+      log(`sale release: seats for ${dateISO} were already on sale at ${dhakaClock(at)} Dhaka — `
+        + 'no "still closed" sighting to bracket against, so today tells us nothing. '
+        + 'Leaving the release time as it was.');
+    }
+    return { measured: null, inconclusive: 'no absent sighting today', dateISO };
+  }
+
+  const bracketMs = at.getTime() - new Date(usable.absentAt).getTime();
+  if (bracketMs > PROBE_MAX_BRACKET_MS) {
+    // We did see it closed, but too long ago for the sighting to name a minute.
+    log(`sale release: seats for ${dateISO} appeared between ${usable.absentAtDhaka} and `
+      + `${dhakaClock(at)} Dhaka — a ${Math.round(bracketMs / 60_000)} minute gap is too wide `
+      + 'to call, so the release time is unchanged.');
+    return { measured: null, inconclusive: 'bracket too wide', bracketMs, dateISO };
+  }
+
+  // The release is in (absentAt, seenAt]. Round the sighting down to the
+  // minute: a scheduled clock time cannot be later than when it was seen, and
+  // the bracket is now narrow enough that the minute is not in doubt.
+  const seenAtDhaka = dhakaClock(at);
+  const [oh, om] = seenAtDhaka.split(':');
+  const measured = `${oh}:${om}:00`;
+
   const observed = {
     observedOn: todayDhaka,
     journeyDate: dateISO,
     route: `${fromCity} > ${toCity}`,
+    // Both ends of the bracket, so the precision is inspectable rather than
+    // asserted. resolutionMs is measured, not the probe interval assumed.
+    absentAt: usable.absentAt,
+    absentAtDhaka: usable.absentAtDhaka,
     seenAt: at.toISOString(),
-    seenAtDhaka: new Intl.DateTimeFormat('en-GB', {
-      timeZone: TZ, hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false,
-    }).format(at),
+    seenAtDhaka,
     onlineSeats: live.onlineSeats,
-    resolutionMs: PROBE_INTERVAL_MS,
+    resolutionMs: bracketMs,
   };
-
-  // Round down to the minute: the release is a scheduled clock time, and the
-  // sighting can only be at or after it.
-  const [oh, om] = observed.seenAtDhaka.split(':');
-  const measured = `${oh}:${om}:00`;
 
   await setMeta(SALE_OPEN_EVIDENCE_KEY, JSON.stringify(observed));
   await setMeta(SALE_OPEN_TIME_KEY, measured);
-  log(`sale release measured: seats for ${dateISO} appeared by ${observed.seenAtDhaka} Dhaka `
-    + `(${observed.onlineSeats} seats, ±${Math.round(PROBE_INTERVAL_MS / 1000)}s) — alarms now use ${measured}`);
+  await setMeta(SALE_OPEN_PENDING_KEY, '');
+  log(`sale release measured: seats for ${dateISO} were absent at ${usable.absentAtDhaka} and `
+    + `present at ${seenAtDhaka} Dhaka (${observed.onlineSeats} seats, `
+    + `±${Math.round(bracketMs / 1000)}s) — alarms now use ${measured}`);
 
   return { measured, observed };
 }
 
-/** What the probe has learned, for the UI. */
+/**
+ * What the probe has learned, for the UI.
+ *
+ * `evidence` only ever describes a real bracket. A day that told us nothing
+ * (seats already on sale at the first look) leaves `inconclusiveOn` behind
+ * instead, so the UI can stop claiming a time was "measured" when it was not.
+ */
 export async function saleReleaseEvidence() {
   const raw = await getMeta(SALE_OPEN_EVIDENCE_KEY);
   const time = await getMeta(SALE_OPEN_TIME_KEY);
-  return { time: time || null, evidence: raw ? JSON.parse(raw) : null };
+  let evidence = null;
+  try { evidence = raw ? JSON.parse(raw) : null; } catch { /* unreadable — no evidence */ }
+
+  // The same rule effectiveSaleOpenTime() applies, so the UI can never report a
+  // time the app is not actually using. An unbracketed value in the database —
+  // an older build still writing first-sightings — surfaces as nothing at all.
+  const sound = isBracketedMeasurement(evidence);
+  return {
+    time: sound ? time || null : null,
+    evidence: sound ? evidence : null,
+    unmeasured: !sound && time ? { storedTime: time, reason: 'no closed-to-open bracket' } : null,
+    inconclusive: evidence?.inconclusiveOn
+      ? { on: evidence.inconclusiveOn, reason: evidence.inconclusiveReason || null }
+      : null,
+  };
+}
+
+/**
+ * Throw away a measured release time and start again.
+ *
+ * Needed because a bad measurement is sticky: it wins over the default forever,
+ * and the probe skips any day it thinks it has already measured.
+ */
+export async function resetSaleRelease() {
+  const previous = await getMeta(SALE_OPEN_TIME_KEY);
+  await setMeta(SALE_OPEN_TIME_KEY, '');
+  await setMeta(SALE_OPEN_EVIDENCE_KEY, '');
+  await setMeta(SALE_OPEN_PENDING_KEY, '');
+  return { cleared: previous || null };
 }

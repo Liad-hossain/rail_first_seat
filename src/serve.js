@@ -1,10 +1,3 @@
-/**
- * Long-running Node entry point: HTTP listener plus the background workers
- * (Telegram listener, alarm scheduler, history collector) that a persistent
- * process can host and a serverless platform cannot.
- *
- * The routes themselves live in src/server.js.
- */
 import http from 'node:http';
 import { PORT, NODE_ENV, SALE_OPEN_TIME } from './config.js';
 import { migrate, verifyConnection, catalogIsEmpty, closePool } from './db.js';
@@ -23,10 +16,6 @@ import {
 
 /* -------------------------------- wiring -------------------------------- */
 
-/**
- * Node HTTP adapter. All routing, validation and error mapping happen in
- * dispatch(); this only translates between Node's req/res and plain values.
- */
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
 
@@ -56,11 +45,6 @@ const server = http.createServer(async (req, res) => {
 
 /* --------------------------------- boot --------------------------------- */
 
-/**
- * Turn listen failures into an explanation instead of an unhandled 'error'
- * event and a stack trace. EADDRINUSE in particular is routine — usually an
- * earlier instance of this very server still running.
- */
 server.on('error', (err) => {
   if (err.code === 'EADDRINUSE') {
     console.error(
@@ -94,13 +78,8 @@ async function start() {
     process.exit(1);
   }
 
-  // Must happen before the collector or any search runs: the session token is
-  // only accepted alongside the device it was issued to.
   setDeviceIdentity(await getDeviceIdentity());
 
-  // Seeds the shared bot from TELEGRAM_BOT_TOKEN, if the deployment sets one,
-  // before anything reports on it. Bots are per user; this is only the one a
-  // visitor with no bot of their own can still pair with.
   await ensureBots({ log: console.log });
 
   const [catalog, token, overview, notify, bots, release] = await Promise.all([
@@ -119,8 +98,12 @@ async function start() {
     console.log(`  history : ${overview.snapshots} snapshot(s) recorded`);
     console.log(`  release : seats open ${release.time || SALE_OPEN_TIME} Dhaka`
       + (release.evidence
-        ? ` (measured ${release.evidence.observedOn})`
-        : ' (default — will self-correct once a session token lets it be measured)'));
+        ? ` (measured ${release.evidence.observedOn}, closed ${release.evidence.absentAtDhaka}`
+          + ` → open ${release.evidence.seenAtDhaka})`
+        : release.unmeasured
+          ? ` (default — ignoring a stored ${release.unmeasured.storedTime} with ${release.unmeasured.reason};`
+            + ' an older build writing to this database records first sightings, not measurements)'
+          : ' (default — will self-correct once a session token lets it be measured)'));
     console.log(`  alarms  : ${bots
       ? `${bots} Telegram bot(s) connected`
         + (notify.sharedBot ? `, shared @${notify.sharedBot.username}` : ', none shared')

@@ -1047,8 +1047,15 @@ async function renderAlarms() {
     page. That moment is known in advance, so the alarm is scheduled on it rather than polled for
     — it rings on the second, with no session token needed.</p>
     <p class="fine">${metaSaleOpen()?.source === 'measured'
-      ? `That time was <b>measured</b> from live seat data${metaSaleOpen()?.measuredAt ? ` (seats first seen at ${esc(metaSaleOpen().measuredAt)} Dhaka)` : ''}, not assumed.`
-      : 'Bangladesh Railway does not publish this time, so it starts from the documented default and is corrected automatically the first time the app watches seats appear.'}</p>
+      ? `That time was <b>measured</b> from live seat data — this date was still closed at
+         ${esc(metaSaleOpen().closedAt || '?')} and had seats by
+         ${esc(metaSaleOpen().measuredAt || '?')} Dhaka${metaSaleOpen()?.precisionSeconds
+           ? ` (±${metaSaleOpen().precisionSeconds}s)` : ''}, so the release is between the two.`
+      : `Bangladesh Railway does not publish this time, so it starts from the documented default
+         and is corrected only when the app watches a date go from closed to open — seeing seats
+         already on sale proves nothing about when they arrived.${metaSaleOpen()?.inconclusive
+           ? ` (Today told us nothing: ${esc(metaSaleOpen().inconclusive.reason || 'no closed sighting')}.)`
+           : ''}`}</p>
     <p class="fine">${status.repeats
       ? `It re-rings every ${status.ringIntervalSeconds ?? 10} seconds for up to ${status.ringMinutes ?? 15} minutes until you tap <b>Stop alarm</b>.`
       : 'You get <b>one</b> message per alarm — the ringing is your phone\'s job (below), so repeats would only clutter the chat. Delivery is retried behind the scenes if Telegram is slow, but only ever one message arrives.'}

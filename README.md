@@ -162,7 +162,18 @@ has moved before, so the app does not merely trust the default: once a session
 token is present it **measures** the release each day by watching the newest
 journey date, and the measured value then drives every alarm (`observed_sale_open_time`
 in `meta`; see `probeSaleRelease` in `src/history.js`). Pending alarms are
-re-timed automatically when a measurement lands. The site computes the exact
+re-timed automatically when a measurement lands.
+
+**A measurement is a bracket, never a sighting.** The probe records both ends —
+this date was still closed at A, and had seats by B, so the release is in
+(A, B] — and only accepts the result when that gap is under
+`PROBE_MAX_BRACKET_MS`. Seeing seats already on sale is *not* evidence: it dates
+the observer, not the release. Without that rule a deployment whose session
+token was first saved at 09:47 probed five seconds later, found the sale already
+open, and recorded **09:48 as the network-wide release time for a sale that
+opens at 08:00** — arming every alarm 108 minutes late while the UI captioned it
+"measured, not assumed". A day that cannot be bracketed is now reported as
+inconclusive and changes nothing. The site computes the exact
 moment for your date, shows a live
 countdown, and hands you an `.ics` reminder with a 10-minute alarm so you are
 logged in and on the search page before it opens.
@@ -672,8 +683,12 @@ upstream form (`Biman_Bandar`).
   observation — seats are absent at 00:00 and present by 11:15 — and 08:00 is
   the only clock time Bangladesh Railway publishes in that range. The probe
   exists precisely because that reasoning could be wrong: it replaces the guess
-  with a measurement as soon as one is available. Override with
-  `BR_SALE_OPEN_TIME=HH:MM:SS` if you know better.
+  with a measurement as soon as a properly bracketed one is available — closed
+  at A, open at B, gap under `PROBE_MAX_BRACKET_MS`. Override with
+  `BR_SALE_OPEN_TIME=HH:MM:SS` if you know better, and call `resetSaleRelease()`
+  in `src/history.js` to throw away a measurement you do not trust (a bad one is
+  sticky: it beats the default forever, and the probe skips any day it believes
+  it has already measured).
 - The 08:00 / 14:00 zone opening times (`ZONE_OPENING_TIME`, and the per-train
   `opening_time` read live from upstream) are the operator's published counter
   hours and are shown for information only. They do **not** gate when a date

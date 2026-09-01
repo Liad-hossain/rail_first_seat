@@ -284,7 +284,16 @@ const handlers = {
       saleOpen: {
         time: saleOpenTime.slice(0, 5),
         source: saleOpenTimeSource(),
+        // Both ends of the bracket the measurement rests on. A sighting with no
+        // "still closed" observation before it is not a measurement at all and
+        // never reaches here — `inconclusive` says so instead, so the UI cannot
+        // present a first look as a measured release time.
         measuredAt: release.evidence?.seenAtDhaka || null,
+        closedAt: release.evidence?.absentAtDhaka || null,
+        precisionSeconds: release.evidence?.resolutionMs
+          ? Math.round(release.evidence.resolutionMs / 1000)
+          : null,
+        inconclusive: release.inconclusive || null,
       },
       seatClasses: SEAT_CLASSES.map((c) => ({ code: c, label: SEAT_CLASS_LABELS[c] || c })),
       officialSite: SITE_BASE,

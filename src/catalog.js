@@ -1,12 +1,4 @@
-/**
- * Builds the route graph from the two PUBLIC upstream endpoints.
- *
- * /all-trains/info gives only origin and destination, which is not enough to
- * answer "which trains run Dhaka -> Sreemangal" — Sreemangal is an intermediate
- * stop. So we fetch each train's full stop list from /train-routes and store it.
- * After one sync (~134 requests) every route question is answerable from the
- * database.
- */
+
 import { query, one, transact, setMeta, getMeta, isoTimestamp } from './db.js';
 import { fetchAllTrains, fetchTrainRoute } from './shohoz.js';
 import { CRAWL_DELAY_MS } from './config.js';
@@ -31,10 +23,7 @@ function parseHalt(halt) {
   return Number.isFinite(n) ? n : null;
 }
 
-/**
- * Sync the whole catalog. Emits progress via `onProgress`.
- * `sampleDate` is just a plausible service date used to resolve timetables.
- */
+
 export async function syncCatalog({ onProgress = () => {}, delayMs = CRAWL_DELAY_MS } = {}) {
   const sampleDate = addDays(todayISO(), 3);
   const trains = await fetchAllTrains();
@@ -58,8 +47,6 @@ export async function syncCatalog({ onProgress = () => {}, delayMs = CRAWL_DELAY
 
   const now = new Date().toISOString();
 
-  // One transaction: the catalog is either wholly replaced or left untouched,
-  // so a mid-sync failure can never leave the site with a half-built graph.
   await transact(async (tx) => {
     await tx.query('DELETE FROM stops');
     await tx.query('DELETE FROM trains');
@@ -86,8 +73,6 @@ export async function syncCatalog({ onProgress = () => {}, delayMs = CRAWL_DELAY
 
       const stops = r.routes || [];
       if (stops.length) {
-        // Multi-row insert: 134 trains x ~13 stops is far too many round trips
-        // to send one at a time over a remote connection.
         const values = [];
         const params = [];
         stops.forEach((stop, idx) => {
@@ -160,10 +145,7 @@ export async function listStations() {
   return rows.map((r) => ({ city: r.city_name, label: r.label, trains: r.train_count }));
 }
 
-/**
- * Every train that stops at `fromCity` and later at `toCity`, in that order.
- * This is the query /all-trains/info alone cannot answer.
- */
+
 export async function findTrainsForRoute(fromCity, toCity) {
   const rows = await query(`
     SELECT t.train_number, t.train_name, t.zone, t.opening_time, t.running_days,
