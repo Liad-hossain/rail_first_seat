@@ -1,5 +1,5 @@
 # rail_first_seat
-Website Link: https://rail-first-seat.netlify.app/?from=Dhaka&to=Sreemangal&date=2026-09-11
+Website Link: https://rail-first-seat.netlify.app
 
 Answers the question the official Bangladesh Railway site refuses to: **for a
 given station pair and a given date, when do the tickets actually go on sale,
