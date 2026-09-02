@@ -1,4 +1,5 @@
 # rail_first_seat
+Website Link: https://rail-first-seat.netlify.app/?from=Dhaka&to=Sreemangal&date=2026-09-11
 
 Answers the question the official Bangladesh Railway site refuses to: **for a
 given station pair and a given date, when do the tickets actually go on sale,
@@ -8,16 +9,6 @@ which trains run it, and are there seats right now?**
 10-day selling window. Ask it about Dhaka → Sreemangal for a date six weeks out
 and you get nothing at all. This site answers for any date, months ahead.
 
-```
-Dhaka → Sreemangal, 15 Oct 2026
-
-  Tickets go on sale 5 Oct 2026, Mon at 8:00 AM BST [39d 14h 33m countdown]
-
-  709  PARABAT EXPRESS    06:30 → 10:32   4h 2m   6 stops   off day Mon
-  717  JAYENTIKA EXPRESS  11:15 → 16:01   4h 46m  10 stops  off day Tue
-  773  KALNI EXPRESS      14:55 → 18:52   3h 57m  5 stops   off day Fri
-  739  UPABAN EXPRESS     22:00 → 02:09   4h 9m   4 stops   off day Wed  (+1 day)
-```
 
 Storage is **Supabase Postgres**. Frontend is plain HTML/CSS/JS with no build
 step. The only runtime dependency is the `pg` driver.
@@ -592,42 +583,6 @@ strictly worse than running a persistent process.
   Each listener now detects that a webhook is in charge of its bot (recorded in
   `bots.delivery_mode`), refuses to poll and leaves it alone, and the alarm cron
   re-registers every bot's webhook if one ever goes missing.
-
----
-
-## Project layout
-
-```
-src/
-  config.js       env loading, secret validation, sale-window constants
-  time.js         Asia/Dhaka (UTC+6) date maths and the API's DD-MMM-YYYY format
-  shohoz.js       upstream client, error normalisation, booking deep links
-  db.js           Supabase Postgres pool, schema, DATE/BIGINT type handling
-  catalog.js      timetable crawler and the route-graph queries
-  availability.js the three "first availability" answers
-  history.js      snapshot recording, history digests, hourly collector
-  telegram.js     Bot API transport and the long-poll update loop (no deps)
-  bots.js         the bot registry: whose bot is whose, and who may change it
-  notify.js       alarm rules, the 3-per-person cap, pairing, the scheduler
-  session.js      who is signed in, and their own railway session
-  server.js       routes, validation, security headers, transport-agnostic dispatch()
-  serve.js        Node entry point: HTTP listener + background workers
-web/
-  index.html styles.css app.js       no framework, no build step
-scripts/
-  db-setup.js  sync-catalog.js  run-snapshot.js
-netlify/functions/
-  api.mjs  telegram-webhook.mjs  alarm-tick.mjs  collect.mjs
-supabase/
-  schema.sql      the same DDL the server applies, for the Supabase SQL editor
-test/
-  live-merge.test.mjs   seat parsing and catalog merge
-  alarms.test.mjs       alarm rules and firing precision
-  credentials.test.mjs  token normalisation and the device headers
-  accounts.test.mjs     what is public, what needs an account, what stays private
-  sale-time.test.mjs    the measured release time and alarm re-timing
-  stop-signal.test.mjs  the stop tag a phone automation matches on
-```
 
 ---
 
